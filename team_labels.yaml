@@ -1,0 +1,11 @@
+# Overrides for team display labels, used when multiple TVO teams share the
+# same league category and need to be told apart (jersey colors).
+# team_id: "display label"
+# Update this whenever the roster changes at season turnover (see `refresh-teams`
+# output for current team IDs).
+430043: "Junioren D Rot"
+428478: "Junioren D Weiss"
+430201: "Junioren D Blau"
+429806: "Junioren E Rot"
+432099: "Junioren E Weiss"
+432604: "Junioren E Blau"

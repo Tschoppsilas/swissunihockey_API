@@ -1,0 +1,5 @@
+club_id: 696
+api_base: "https://api.swissunihockey.ch/rest/v1.0"
+output_dir: "output"
+cache_dir: "cache"
+team_cache_staleness_days: 7
