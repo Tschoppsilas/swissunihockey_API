@@ -9,7 +9,6 @@ from . import layout
 from .api_client import ApiClient
 from .config import load_config, load_team_labels
 from .grouping import (
-    dedupe_games,
     format_weekend_title,
     group_by_category,
     group_games_by_week,
@@ -30,39 +29,51 @@ GAMES_FETCH_LIMIT = 200
 def _fetch_team_games(
     client: ApiClient, teams: list[Team], status: str, order: str
 ) -> list[TeamGame]:
-    games: list[Game] = []
-    owner_by_game_id: dict[int, int] = {}
+    """One TeamGame per (team, game) pair - fetched from each team's own
+    fixture list, independently.
+
+    Deliberately NOT deduplicated across teams: when two TVO teams play each
+    other (e.g. Junioren D Blau vs. D Weiss), the same underlying game must
+    show up twice - once as D Blau's fixture, once as D Weiss's - since each
+    is its own category block with its own full schedule. Deduping by game
+    id (as this used to do) silently dropped the game from whichever team
+    was processed second.
+    """
+    labels = load_team_labels()
+    category_by_team_id = {t.id: labels.get(t.id, t.category) for t in teams}
+    tvo_team_ids = set(category_by_team_id)
+
+    team_games: list[TeamGame] = []
     for team in teams:
         raw_games = client.get_team_games(
             team.id, status=status, limit=GAMES_FETCH_LIMIT, order=order
         )
         for raw in raw_games:
             game = Game.from_api(raw)
-            games.append(game)
-            owner_by_game_id.setdefault(game.id, team.id)
-
-    games = dedupe_games(games)
-    games = [g for g in games if not g.canceled]
-
-    labels = load_team_labels()
-    category_by_team_id = {t.id: labels.get(t.id, t.category) for t in teams}
-
-    team_games: list[TeamGame] = []
-    for game in games:
-        our_id = owner_by_game_id[game.id]
-        is_home = our_id == game.home_team_id
-        team_games.append(
-            TeamGame(
-                game=game,
-                category=category_by_team_id.get(
-                    our_id, game.category_text or game.league_text
-                ),
-                opponent=game.away_team if is_home else game.home_team,
-                our_goals=game.goals_home if is_home else game.goals_away,
-                opp_goals=game.goals_away if is_home else game.goals_home,
-                is_home=is_home,
+            if game.canceled:
+                continue
+            is_home = team.id == game.home_team_id
+            opponent_id = game.away_team_id if is_home else game.home_team_id
+            raw_opponent_name = game.away_team if is_home else game.home_team
+            opponent_is_tvo = opponent_id in tvo_team_ids
+            # For an internal TVO-vs-TVO duel, show the other side's mapped
+            # display name too (e.g. "Junioren E Rot"), not its raw API team
+            # name ("TV Oberwil BL III") - the same mapping already used for
+            # category badges, just not applied to the opponent before.
+            opponent = category_by_team_id[opponent_id] if opponent_is_tvo else raw_opponent_name
+            team_games.append(
+                TeamGame(
+                    game=game,
+                    category=category_by_team_id.get(
+                        team.id, game.category_text or game.league_text
+                    ),
+                    opponent=opponent,
+                    our_goals=game.goals_home if is_home else game.goals_away,
+                    opp_goals=game.goals_away if is_home else game.goals_home,
+                    is_home=is_home,
+                    opponent_is_tvo=opponent_is_tvo,
+                )
             )
-        )
     return team_games
 
 
@@ -83,7 +94,9 @@ def _generate_weeks(
     dry_run: bool,
     template_cls: type = InstagramV1Template,
     profile: layout.CanvasProfile = layout.FEED_PROFILE,
+    template_kwargs: dict | None = None,
 ) -> None:
+    template_kwargs = template_kwargs or {}
     for week_key_str, week_games in grouped_weeks.items():
         categorized = group_by_category(week_games)
         pages = paginate_by_category(categorized, kind, profile)
@@ -91,10 +104,24 @@ def _generate_weeks(
         click.echo(f"{week_key_str}: {len(week_games)} Spiele -> {len(pages)} Bild(er)")
         if dry_run:
             continue
-        template = template_cls(kind=kind)
+        template = template_cls(kind=kind, **template_kwargs)
         paths = render_batches(template, pages, out_root / week_key_str, "post", title)
         for p in paths:
             click.echo(f"  geschrieben: {p}")
+
+
+def _report_missing_venues(team_games: list[TeamGame]) -> None:
+    """Print every game whose venue isn't assigned yet, so it can never slip
+    through unnoticed even though the image itself already stamps it - grep
+    for the 'FEHLENDE HALLE:' prefix to pull this into an outer script."""
+    missing = [tg for tg in team_games if not tg.game.venue]
+    if not missing:
+        click.echo("Keine fehlenden Hallen-Zuweisungen.")
+        return
+    click.echo(f"\n⚠ {len(missing)} Spiel(e) ohne Hallen-Zuweisung:")
+    for tg in sorted(missing, key=lambda tg: (tg.date, tg.game.time or "")):
+        time_str = tg.game.time or "?"
+        click.echo(f"  FEHLENDE HALLE: {tg.category} | {tg.date:%d.%m.%Y} {time_str} | vs {tg.opponent}")
 
 
 @click.group()
@@ -127,7 +154,14 @@ def announce(output_dir: Path | None, dry_run: bool) -> None:
 
     grouped_weeks = group_games_by_week(team_games)
     out_root = (output_dir or cfg.output_dir) / "announcements"
-    _generate_weeks("announce", grouped_weeks, out_root, dry_run)
+    _generate_weeks(
+        "announce",
+        grouped_weeks,
+        out_root,
+        dry_run,
+        template_kwargs={"missing_venue_text": cfg.missing_venue_text},
+    )
+    _report_missing_venues(team_games)
 
 
 @main.command()
@@ -154,8 +188,15 @@ def story(output_dir: Path | None, dry_run: bool) -> None:
     grouped_weeks = group_games_by_week(team_games)
     out_root = (output_dir or cfg.output_dir) / "story"
     _generate_weeks(
-        "announce", grouped_weeks, out_root, dry_run, template_cls=StoryTemplate, profile=layout.STORY_PROFILE
+        "announce",
+        grouped_weeks,
+        out_root,
+        dry_run,
+        template_cls=StoryTemplate,
+        profile=layout.STORY_PROFILE,
+        template_kwargs={"missing_venue_text": cfg.missing_venue_text},
     )
+    _report_missing_venues(team_games)
 
 
 @main.command()

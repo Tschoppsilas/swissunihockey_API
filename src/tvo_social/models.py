@@ -4,6 +4,21 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Literal
 
+# The API doesn't leave gym.content empty/null when no venue is assigned -
+# it sends a placeholder string instead (observed: "-", with gym.id -1).
+# Normalizing here, once, at the parsing boundary means every downstream
+# check (venue pill, missing-venue stamp, console report) that tests
+# `not game.venue` just works, instead of each needing its own placeholder
+# list.
+_MISSING_VENUE_PLACEHOLDERS = {"-", "–", "—", "tbd", "n/a", "noch offen", "offen"}
+
+
+def _normalize_venue(raw_venue: str) -> str:
+    stripped = raw_venue.strip()
+    if not stripped or stripped.lower() in _MISSING_VENUE_PLACEHOLDERS:
+        return ""
+    return raw_venue
+
 
 @dataclass(frozen=True)
 class Team:
@@ -54,7 +69,7 @@ class Game:
             away_team=raw["awayteamname"],
             home_team_id=raw["hometeamid"],
             away_team_id=raw["awayteamid"],
-            venue=(raw.get("gym") or {}).get("content", ""),
+            venue=_normalize_venue((raw.get("gym") or {}).get("content", "")),
             league_text=raw.get("leaguetext", ""),
             category_text=raw.get("grouptext", ""),
             played=raw.get("played", False),
@@ -84,6 +99,7 @@ class TeamGame:
     our_goals: int | None
     opp_goals: int | None
     is_home: bool
+    opponent_is_tvo: bool = False
 
     @property
     def date(self) -> date:

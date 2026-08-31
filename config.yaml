@@ -6,3 +6,6 @@ team_cache_staleness_days: 7
 # Venue name (must match the API's gym.content exactly) that counts as a
 # TVO home tournament, used to filter the announcement feed post.
 home_venue: "Thomasgarten (Oberwil BL)"
+# Shown as a warning stamp on any game card whose venue isn't assigned yet,
+# and as the venue-pill fallback text for a category with no venue at all.
+missing_venue_text: "ORT FOLGT"

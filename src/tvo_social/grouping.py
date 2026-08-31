@@ -4,22 +4,7 @@ from datetime import date, timedelta
 from typing import Literal
 
 from . import layout
-from .models import Game, TeamGame
-
-# Rough age/seniority ordering for section sorting within a post. Matched as a
-# case-insensitive substring against each category's display label; anything
-# unmatched sorts alphabetically after all known categories.
-CATEGORY_PRIORITY = [
-    "Herren",
-    "Damen",
-    "U18",
-    "U16",
-    "U14",
-    "Junioren C",
-    "Junioren D",
-    "Junioren E",
-    "Junioren F",
-]
+from .models import TeamGame
 
 
 def week_bounds(d: date) -> tuple[date, date]:
@@ -61,20 +46,6 @@ def half_season_end(today: date) -> date:
     return date(today.year, 12, 31)
 
 
-def dedupe_games(games: list[Game]) -> list[Game]:
-    """Remove duplicate games (same game can appear twice when both
-    the home and away team are TVO teams, since games are fetched
-    per-team)."""
-    seen: set[int] = set()
-    unique: list[Game] = []
-    for game in games:
-        if game.id in seen:
-            continue
-        seen.add(game.id)
-        unique.append(game)
-    return unique
-
-
 def format_date_range(dates: list[date]) -> str:
     """Format a set of dates as a single day ('20.09.') or a range
     ('19.-20.09.' same month, '28.09.-04.10.' across months)."""
@@ -103,24 +74,19 @@ def group_games_by_week(team_games: list[TeamGame]) -> dict[str, list[TeamGame]]
     return grouped
 
 
-def _category_sort_key(label: str) -> tuple[int, str]:
-    lower = label.lower()
-    for index, keyword in enumerate(CATEGORY_PRIORITY):
-        if keyword.lower() in lower:
-            return (index, label)
-    return (len(CATEGORY_PRIORITY), label)
-
-
 def group_by_category(team_games: list[TeamGame]) -> dict[str, list[TeamGame]]:
-    """Group one week's games by display category, in a sensible section order
-    (Herren/Damen first, then Junioren oldest to youngest), games within a
-    category sorted chronologically."""
+    """Group one week's games by display category, sections ordered by each
+    category's own earliest game (date, then time) - whichever team plays
+    first shows first, rather than a fixed seniority order. Games within a
+    category are sorted chronologically."""
     grouped: dict[str, list[TeamGame]] = {}
     for tg in team_games:
         grouped.setdefault(tg.category, []).append(tg)
     for games in grouped.values():
         games.sort(key=lambda tg: (tg.date, tg.game.time or ""))
-    return dict(sorted(grouped.items(), key=lambda kv: _category_sort_key(kv[0])))
+    return dict(
+        sorted(grouped.items(), key=lambda kv: (kv[1][0].date, kv[1][0].game.time or "", kv[0]))
+    )
 
 
 def paginate_by_category(

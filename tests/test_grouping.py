@@ -4,7 +4,6 @@ import pytest
 
 from tvo_social import layout
 from tvo_social.grouping import (
-    dedupe_games,
     group_by_category,
     group_games_by_week,
     half_season_end,
@@ -96,14 +95,6 @@ def test_last_completed_week_on_monday():
     assert end == date(2026, 9, 20)
 
 
-def test_dedupe_games_removes_duplicate_ids():
-    g1 = make_game(1, date(2026, 9, 16))
-    g2 = make_game(1, date(2026, 9, 16))
-    g3 = make_game(2, date(2026, 9, 17))
-    result = dedupe_games([g1, g2, g3])
-    assert [g.id for g in result] == [1, 2]
-
-
 def test_group_games_by_week_splits_and_sorts():
     tg1 = make_team_game(1, date(2026, 9, 20), "18:00")  # W38
     tg2 = make_team_game(2, date(2026, 9, 14), "10:00")  # W38, earlier
@@ -116,21 +107,31 @@ def test_group_games_by_week_splits_and_sorts():
     assert [tg.game.id for tg in grouped["2026-W39"]] == [3]
 
 
-def test_group_by_category_orders_seniority_first_then_juniors():
+def test_group_by_category_orders_by_first_game_start_time():
     d = date(2026, 9, 14)
     games = [
-        make_team_game(1, d, category="Junioren D Rot"),
-        make_team_game(2, d, category="Herren Aktive GF 4. Liga"),
-        make_team_game(3, d, category="Junioren U14 B"),
-        make_team_game(4, d, category="Damen Aktive KF 3. Liga"),
+        make_team_game(1, d, "14:00", category="Junioren D Rot"),
+        make_team_game(2, d, "09:00", category="Herren Aktive GF 4. Liga"),
+        make_team_game(3, d, "11:30", category="Junioren U14 B"),
+        make_team_game(4, d, "10:15", category="Damen Aktive KF 3. Liga"),
     ]
     grouped = group_by_category(games)
+    # Sorted by each category's earliest game time, not seniority/alphabet.
     assert list(grouped.keys()) == [
-        "Herren Aktive GF 4. Liga",
-        "Damen Aktive KF 3. Liga",
-        "Junioren U14 B",
-        "Junioren D Rot",
+        "Herren Aktive GF 4. Liga",  # 09:00
+        "Damen Aktive KF 3. Liga",  # 10:15
+        "Junioren U14 B",  # 11:30
+        "Junioren D Rot",  # 14:00
     ]
+
+
+def test_group_by_category_orders_by_date_before_time():
+    games = [
+        make_team_game(1, date(2026, 9, 14), "09:00", category="Saturday Team"),
+        make_team_game(2, date(2026, 9, 13), "20:00", category="Friday Team"),
+    ]
+    grouped = group_by_category(games)
+    assert list(grouped.keys()) == ["Friday Team", "Saturday Team"]
 
 
 def test_group_by_category_sorts_games_within_category():

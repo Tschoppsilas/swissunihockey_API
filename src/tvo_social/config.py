@@ -17,6 +17,7 @@ class Config:
     cache_dir: Path = Path("cache")
     team_cache_staleness_days: int = 7
     home_venue: str = "Thomasgarten (Oberwil BL)"
+    missing_venue_text: str = "ORT FOLGT"
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -35,6 +36,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
             "team_cache_staleness_days", Config.team_cache_staleness_days
         ),
         home_venue=raw.get("home_venue", Config.home_venue),
+        missing_venue_text=raw.get("missing_venue_text", Config.missing_venue_text),
     )
 
 

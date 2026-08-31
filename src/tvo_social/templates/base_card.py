@@ -41,6 +41,26 @@ RESULT_COLORS: dict[str, tuple[int, int, int, int]] = {
 # problem.
 TVO_RED_ON_DARK = (255, 64, 84, 255)
 
+# Finalized card finish, confirmed over several draft rounds: a hairline
+# white edge all around, plus a soft blurred white glow hugging the bottom
+# ("draft2" of the box-shadow comparison) for a subtle lifted-card look.
+DEFAULT_BORDER_COLOR: tuple[int, int, int, int] | None = (255, 255, 255, 26)  # ~0.10 alpha
+DEFAULT_SHADOW_OFFSET = 3
+DEFAULT_SHADOW_BLUR = 5
+DEFAULT_SHADOW_COLOR: tuple[int, int, int, int] | None = (255, 255, 255, 41)  # ~0.16 alpha
+
+# Confirmed as "spacing_draft2_plus_100" - noticeably airier than the initial
+# tight layout.
+DEFAULT_TIME_MATCHUP_GAP = 48
+
+# Deliberately off-brand (amber, not red/black/white) so it reads as a
+# warning/attention marker distinct from the club's own styling - a stamp
+# that could be mistaken for a normal design element would defeat its point.
+DEFAULT_MISSING_VENUE_TEXT = "ORT FOLGT"
+STAMP_BG = (255, 176, 32, 235)
+STAMP_TEXT = (20, 20, 20, 255)
+STAMP_ANGLE = -10
+
 # Safe content zone: below the top-left club logo, clear of the right margin.
 # Shared by every template - both feed and story canvases are 1080px wide,
 # only their available height differs (see layout.CanvasProfile). These stay
@@ -109,6 +129,7 @@ class Metrics:
     time_font: object
     matchup_font: object
     score_font: object
+    stamp_font: object
 
 
 class BaseCardTemplate:
@@ -126,12 +147,13 @@ class BaseCardTemplate:
     def __init__(
         self,
         kind: Literal["announce", "results"],
-        border_color: tuple[int, int, int, int] | None = None,
-        shadow_offset: float = 0,
-        shadow_blur: float = 0,
-        shadow_color: tuple[int, int, int, int] | None = None,
+        border_color: tuple[int, int, int, int] | None = DEFAULT_BORDER_COLOR,
+        shadow_offset: float = DEFAULT_SHADOW_OFFSET,
+        shadow_blur: float = DEFAULT_SHADOW_BLUR,
+        shadow_color: tuple[int, int, int, int] | None = DEFAULT_SHADOW_COLOR,
         tvo_label_color: tuple[int, int, int, int] = TVO_RED_ON_DARK,
-        time_matchup_gap: int = 24,
+        time_matchup_gap: int = DEFAULT_TIME_MATCHUP_GAP,
+        missing_venue_text: str = DEFAULT_MISSING_VENUE_TEXT,
     ) -> None:
         self.kind = kind
         self.border_color = border_color
@@ -140,6 +162,7 @@ class BaseCardTemplate:
         self.shadow_blur = shadow_blur
         self.shadow_color = shadow_color
         self.time_matchup_gap = time_matchup_gap
+        self.missing_venue_text = missing_venue_text
 
     @property
     def canvas_size(self) -> tuple[int, int]:
@@ -183,6 +206,7 @@ class BaseCardTemplate:
             time_font=load_font(FONT_BOLD, round(26 * scale)),
             matchup_font=load_font(FONT_BOLD, round(26 * scale)),
             score_font=load_font(FONT_BOLD, round(30 * scale)),
+            stamp_font=load_font(FONT_BOLD, round(22 * scale)),
         )
 
     def _fits_at_scale(
@@ -209,7 +233,7 @@ class BaseCardTemplate:
                     if tg.game.venue and tg.game.venue not in seen:
                         seen.add(tg.game.venue)
                         venues.append(tg.game.venue)
-                venue_str = " / ".join(venues) if venues else "Ort noch offen"
+                venue_str = " / ".join(venues) if venues else self.missing_venue_text
                 pill_text_width = draw.textlength(f"{date_str}  ·  {venue_str}", font=m.pill_font)
                 if pill_text_width + m.pill_icon_area + 2 * m.pill_padding_x > pill_available:
                     return False
@@ -378,7 +402,7 @@ class BaseCardTemplate:
             if venue and venue not in seen:
                 seen.add(venue)
                 venues.append(venue)
-        venue_str = " / ".join(venues) if venues else "Ort noch offen"
+        venue_str = " / ".join(venues) if venues else self.missing_venue_text
         text = f"{date_str}  ·  {venue_str}"
 
         text_x = x + m.pill_icon_area + m.pill_padding_x
@@ -418,18 +442,21 @@ class BaseCardTemplate:
         self, draw: ImageDraw.ImageDraw, tg: TeamGame, font, max_width: float
     ) -> list[tuple[str, tuple]]:
         """Build colored (text, color) segments for 'TV OBERWIL VS GEGNER' (or
-        the reverse), always showing the home team first, TV Oberwil in red."""
+        the reverse), always showing the home team first, TV Oberwil in red.
+        For an internal TVO-vs-TVO duel, the opponent side gets the same red
+        highlight - it's also us, just a different category block."""
         opponent = tg.opponent.upper()
+        opponent_color = self.tvo_label_color if tg.opponent_is_tvo else CARD_TEXT
         if tg.is_home:
             fixed = f"{TVO_LABEL} VS "
             fixed_width = draw.textlength(fixed, font=font)
             fitted_opp = fit_line(draw, opponent, font, max(max_width - fixed_width, 20))
-            return [(TVO_LABEL, self.tvo_label_color), (" VS ", CARD_TEXT), (fitted_opp, CARD_TEXT)]
+            return [(TVO_LABEL, self.tvo_label_color), (" VS ", CARD_TEXT), (fitted_opp, opponent_color)]
         else:
             fixed = f" VS {TVO_LABEL}"
             fixed_width = draw.textlength(fixed, font=font)
             fitted_opp = fit_line(draw, opponent, font, max(max_width - fixed_width, 20))
-            return [(fitted_opp, CARD_TEXT), (" VS ", CARD_TEXT), (TVO_LABEL, self.tvo_label_color)]
+            return [(fitted_opp, opponent_color), (" VS ", CARD_TEXT), (TVO_LABEL, self.tvo_label_color)]
 
     def _draw_soft_bottom_shadow(
         self, image: Image.Image, box: list[float], radius: float
@@ -453,6 +480,36 @@ class BaseCardTemplate:
         if self.shadow_blur > 0:
             tile = tile.filter(ImageFilter.GaussianBlur(self.shadow_blur))
         image.paste(tile, (int(x0) - margin, int(y0) - margin), tile)
+
+    def _draw_missing_venue_stamp(
+        self, image: Image.Image, box: list[float], font
+    ) -> None:
+        """A rotated attention banner across a card whose game has no venue
+        yet - deliberately loud (off-brand amber) so it can never be missed
+        when scanning a post before publishing it.
+
+        The tile is exactly card-sized and rotated WITHOUT expanding the
+        canvas, so the diagonal band is clipped to the card itself - it can
+        never bleed into the category badge above or the next card below."""
+        x0, y0, x1, y1 = box
+        card_w = int(x1 - x0)
+        card_h = int(y1 - y0)
+
+        tile = Image.new("RGBA", (card_w, card_h), (0, 0, 0, 0))
+        tile_draw = ImageDraw.Draw(tile, "RGBA")
+        band_h = max(int(card_h * 0.5), 1)
+        band_top = (card_h - band_h) // 2
+        tile_draw.rectangle([0, band_top, card_w, band_top + band_h], fill=STAMP_BG)
+        tile_draw.text(
+            (card_w / 2, band_top + band_h / 2),
+            self.missing_venue_text,
+            font=font,
+            fill=STAMP_TEXT,
+            anchor="mm",
+        )
+
+        rotated = tile.rotate(STAMP_ANGLE, resample=Image.BICUBIC)  # same size, clipped to the card
+        image.paste(rotated, (int(x0), int(y0)), rotated)
 
     def _draw_card(
         self,
@@ -508,5 +565,8 @@ class BaseCardTemplate:
             remaining_width = CONTENT_X + CONTENT_WIDTH - m.card_padding_x - matchup_x
             segments = self._matchup_segments(draw, tg, m.matchup_font, remaining_width)
             self._draw_segments(draw, matchup_x, y + height / 2, segments, m.matchup_font)
+
+            if not tg.game.venue:
+                self._draw_missing_venue_stamp(image, box, m.stamp_font)
 
         return y + height + m.card_gap
