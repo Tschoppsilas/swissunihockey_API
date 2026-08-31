@@ -1,9 +1,26 @@
 from __future__ import annotations
 
+import sys
 from datetime import date, datetime
 from pathlib import Path
 
 import click
+
+
+def _ensure_utf8_console() -> None:
+    """Windows consoles default to a legacy codepage (cp1252, sometimes
+    cp850/437) that can't encode a lot of Unicode - reconfigure stdout/stderr
+    to UTF-8 so nothing we print can crash the process. Belt-and-suspenders:
+    every literal string we print is also kept ASCII-only (see below), so
+    output still works correctly even if reconfigure itself isn't available
+    (e.g. output redirected to something that doesn't support it)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
 
 from . import layout
 from .api_client import ApiClient
@@ -118,7 +135,7 @@ def _report_missing_venues(team_games: list[TeamGame]) -> None:
     if not missing:
         click.echo("Keine fehlenden Hallen-Zuweisungen.")
         return
-    click.echo(f"\n⚠ {len(missing)} Spiel(e) ohne Hallen-Zuweisung:")
+    click.echo(f"\n[WARNUNG] {len(missing)} Spiel(e) ohne Hallen-Zuweisung:")
     for tg in sorted(missing, key=lambda tg: (tg.date, tg.game.time or "")):
         time_str = tg.game.time or "?"
         click.echo(f"  FEHLENDE HALLE: {tg.category} | {tg.date:%d.%m.%Y} {time_str} | vs {tg.opponent}")
@@ -127,6 +144,7 @@ def _report_missing_venues(team_games: list[TeamGame]) -> None:
 @click.group()
 def main() -> None:
     """TV Oberwil Instagram post preparation tool."""
+    _ensure_utf8_console()
 
 
 @main.command()
@@ -140,7 +158,7 @@ def announce(output_dir: Path | None, dry_run: bool) -> None:
 
     today = date.today()
     end_date = half_season_end(today)
-    click.echo(f"Zeitraum: {today:%d.%m.%Y} – {end_date:%d.%m.%Y}")
+    click.echo(f"Zeitraum: {today:%d.%m.%Y} - {end_date:%d.%m.%Y}")
 
     team_games = _fetch_team_games(client, teams, status="planned", order="ASC")
     team_games = [tg for tg in team_games if today <= tg.date <= end_date]
@@ -176,7 +194,7 @@ def story(output_dir: Path | None, dry_run: bool) -> None:
 
     today = date.today()
     end_date = half_season_end(today)
-    click.echo(f"Zeitraum: {today:%d.%m.%Y} – {end_date:%d.%m.%Y}")
+    click.echo(f"Zeitraum: {today:%d.%m.%Y} - {end_date:%d.%m.%Y}")
 
     team_games = _fetch_team_games(client, teams, status="planned", order="ASC")
     team_games = [tg for tg in team_games if today <= tg.date <= end_date]
@@ -223,7 +241,7 @@ def results(
     else:
         start_date, end_date = last_completed_week(date.today())
 
-    click.echo(f"Zeitraum: {start_date:%d.%m.%Y} – {end_date:%d.%m.%Y}")
+    click.echo(f"Zeitraum: {start_date:%d.%m.%Y} - {end_date:%d.%m.%Y}")
 
     team_games = _fetch_team_games(client, teams, status="played", order="DESC")
     team_games = [tg for tg in team_games if start_date <= tg.date <= end_date]
@@ -245,7 +263,7 @@ def refresh_teams() -> None:
     teams = refresh_team_cache(client, cfg)
     click.echo(f"{len(teams)} Teams gefunden:")
     for team in teams:
-        click.echo(f"  [{team.id}] {team.name} – {team.category}")
+        click.echo(f"  [{team.id}] {team.name} - {team.category}")
 
 
 if __name__ == "__main__":
