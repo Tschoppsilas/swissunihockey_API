@@ -181,6 +181,6 @@ def test_paginate_by_category_default_capacity_matches_layout():
     categorized = {"Herren": [make_team_game(1, d)]}
     default_pages = paginate_by_category(categorized, kind="results")
     explicit_pages = paginate_by_category(
-        categorized, kind="results", capacity=layout.page_capacity()
+        categorized, kind="results", capacity=layout.FEED_PROFILE.page_capacity()
     )
     assert default_pages == explicit_pages

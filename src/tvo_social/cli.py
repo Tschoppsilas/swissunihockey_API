@@ -5,10 +5,12 @@ from pathlib import Path
 
 import click
 
+from . import layout
 from .api_client import ApiClient
 from .config import load_config, load_team_labels
 from .grouping import (
     dedupe_games,
+    format_weekend_title,
     group_by_category,
     group_games_by_week,
     half_season_end,
@@ -20,6 +22,7 @@ from .models import Game, Team, TeamGame
 from .render import render_batches
 from .teams import get_teams, refresh_team_cache
 from .templates.instagram_v1 import InstagramV1Template
+from .templates.story import StoryTemplate
 
 GAMES_FETCH_LIMIT = 200
 
@@ -64,10 +67,13 @@ def _fetch_team_games(
 
 
 def _week_title(kind: str, week_key_str: str, week_games: list[TeamGame]) -> str:
+    if kind == "announce":
+        # Games are always on a weekend, so show the actual date(s) rather
+        # than a calendar week number - see grouping.format_weekend_title.
+        return format_weekend_title(week_games, "GAME WEEKEND")
     monday, sunday = week_bounds(week_games[0].date)
     iso_week = week_key_str.split("-W")[1]
-    label = "Ankündigung" if kind == "announce" else "Resultate"
-    return f"{label} KW{iso_week} ({monday:%d.%m.}-{sunday:%d.%m.})"
+    return f"Resultate KW{iso_week} ({monday:%d.%m.}-{sunday:%d.%m.})"
 
 
 def _generate_weeks(
@@ -75,11 +81,12 @@ def _generate_weeks(
     grouped_weeks: dict[str, list[TeamGame]],
     out_root: Path,
     dry_run: bool,
+    template_cls: type = InstagramV1Template,
+    profile: layout.CanvasProfile = layout.FEED_PROFILE,
 ) -> None:
-    template_cls = InstagramV1Template
     for week_key_str, week_games in grouped_weeks.items():
         categorized = group_by_category(week_games)
-        pages = paginate_by_category(categorized, kind)
+        pages = paginate_by_category(categorized, kind, profile)
         title = _week_title(kind, week_key_str, week_games)
         click.echo(f"{week_key_str}: {len(week_games)} Spiele -> {len(pages)} Bild(er)")
         if dry_run:
@@ -110,14 +117,45 @@ def announce(output_dir: Path | None, dry_run: bool) -> None:
 
     team_games = _fetch_team_games(client, teams, status="planned", order="ASC")
     team_games = [tg for tg in team_games if today <= tg.date <= end_date]
+    # Feed post = home tournament only; away games go into the (future)
+    # story template instead, see config.yaml's home_venue.
+    team_games = [tg for tg in team_games if tg.game.venue == cfg.home_venue]
+
+    if not team_games:
+        click.echo("Keine anstehenden Heimspiele im Zeitraum gefunden.")
+        return
+
+    grouped_weeks = group_games_by_week(team_games)
+    out_root = (output_dir or cfg.output_dir) / "announcements"
+    _generate_weeks("announce", grouped_weeks, out_root, dry_run)
+
+
+@main.command()
+@click.option("--output-dir", type=click.Path(path_type=Path), default=None)
+@click.option("--dry-run", is_flag=True, default=False, help="Only print what would be generated.")
+def story(output_dir: Path | None, dry_run: bool) -> None:
+    """Generate the story post (all weekend games, every category, no venue
+    filter) for every week until the next half-season cutoff."""
+    cfg = load_config()
+    client = ApiClient(cfg.api_base)
+    teams = get_teams(client, cfg)
+
+    today = date.today()
+    end_date = half_season_end(today)
+    click.echo(f"Zeitraum: {today:%d.%m.%Y} – {end_date:%d.%m.%Y}")
+
+    team_games = _fetch_team_games(client, teams, status="planned", order="ASC")
+    team_games = [tg for tg in team_games if today <= tg.date <= end_date]
 
     if not team_games:
         click.echo("Keine anstehenden Spiele im Zeitraum gefunden.")
         return
 
     grouped_weeks = group_games_by_week(team_games)
-    out_root = (output_dir or cfg.output_dir) / "announcements"
-    _generate_weeks("announce", grouped_weeks, out_root, dry_run)
+    out_root = (output_dir or cfg.output_dir) / "story"
+    _generate_weeks(
+        "announce", grouped_weeks, out_root, dry_run, template_cls=StoryTemplate, profile=layout.STORY_PROFILE
+    )
 
 
 @main.command()

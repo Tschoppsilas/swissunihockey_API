@@ -15,10 +15,10 @@ def render_page(
     out_path: Path,
 ) -> Path:
     image = template.background()
-    template.render(image, categorized_games, page_idx, page_count, title)
+    image = template.render(image, categorized_games, page_idx, page_count, title)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(out_path)
+    image.convert("RGB").save(out_path)
     return out_path
 
 

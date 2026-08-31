@@ -20,6 +20,8 @@ class Template(Protocol):
         page_idx: int,
         page_count: int,
         title: str,
-    ) -> None:
-        """Draw everything (banners, cards, header) directly onto image."""
+    ) -> Image.Image:
+        """Draw everything (banners, cards, header) and return the final
+        image (may be a different mode/object than the input, e.g. if the
+        template needs RGBA for translucent elements)."""
         ...

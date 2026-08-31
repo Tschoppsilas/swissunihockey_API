@@ -75,6 +75,24 @@ def dedupe_games(games: list[Game]) -> list[Game]:
     return unique
 
 
+def format_date_range(dates: list[date]) -> str:
+    """Format a set of dates as a single day ('20.09.') or a range
+    ('19.-20.09.' same month, '28.09.-04.10.' across months)."""
+    lo, hi = min(dates), max(dates)
+    if lo == hi:
+        return f"{lo:%d.%m.}"
+    if lo.month == hi.month:
+        return f"{lo:%d.}-{hi:%d.%m.}"
+    return f"{lo:%d.%m.}-{hi:%d.%m.}"
+
+
+def format_weekend_title(team_games: list[TeamGame], label: str) -> str:
+    """e.g. 'GAME WEEKEND - 20.09.' from the actual game dates, rather than
+    an ISO week number - games are always on a weekend, so the calendar
+    week label doesn't carry information the reader needs."""
+    return f"{label} - {format_date_range([tg.date for tg in team_games])}"
+
+
 def group_games_by_week(team_games: list[TeamGame]) -> dict[str, list[TeamGame]]:
     """Group games by ISO week, sorted chronologically within and across weeks."""
     ordered = sorted(team_games, key=lambda tg: (tg.date, tg.game.time or ""))
@@ -108,6 +126,7 @@ def group_by_category(team_games: list[TeamGame]) -> dict[str, list[TeamGame]]:
 def paginate_by_category(
     categorized: dict[str, list[TeamGame]],
     kind: Literal["announce", "results"],
+    profile: layout.CanvasProfile = layout.FEED_PROFILE,
     capacity: float | None = None,
 ) -> list[dict[str, list[TeamGame]]]:
     """Split categorized games into pages (one dict per output image),
@@ -115,12 +134,12 @@ def paginate_by_category(
     that alone exceeds the capacity still gets its own (overfull) page
     rather than being split mid-category.
 
-    Capacity defaults to the actual pixel height available on one image
-    (see layout.py), so pagination always matches what the template renders
-    - pass an explicit capacity only for testing.
+    Capacity defaults to the actual pixel height available on one image of
+    the given canvas profile (see layout.py), so pagination always matches
+    what the template renders - pass an explicit capacity only for testing.
     """
     if capacity is None:
-        capacity = layout.page_capacity()
+        capacity = profile.page_capacity()
 
     pages: list[dict[str, list[TeamGame]]] = []
     current: dict[str, list[TeamGame]] = {}

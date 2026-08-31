@@ -3,3 +3,6 @@ api_base: "https://api.swissunihockey.ch/rest/v1.0"
 output_dir: "output"
 cache_dir: "cache"
 team_cache_staleness_days: 7
+# Venue name (must match the API's gym.content exactly) that counts as a
+# TVO home tournament, used to filter the announcement feed post.
+home_venue: "Thomasgarten (Oberwil BL)"
