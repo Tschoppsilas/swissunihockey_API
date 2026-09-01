@@ -154,6 +154,7 @@ class BaseCardTemplate:
         tvo_label_color: tuple[int, int, int, int] = TVO_RED_ON_DARK,
         time_matchup_gap: int = DEFAULT_TIME_MATCHUP_GAP,
         missing_venue_text: str = DEFAULT_MISSING_VENUE_TEXT,
+        section_gap: float = SECTION_GAP,
     ) -> None:
         self.kind = kind
         self.border_color = border_color
@@ -163,6 +164,7 @@ class BaseCardTemplate:
         self.shadow_color = shadow_color
         self.time_matchup_gap = time_matchup_gap
         self.missing_venue_text = missing_venue_text
+        self.section_gap = section_gap
 
     @property
     def canvas_size(self) -> tuple[int, int]:
@@ -196,7 +198,7 @@ class BaseCardTemplate:
             card_radius=CARD_RADIUS * scale,
             card_padding_x=CARD_PADDING_X * h_scale,
             card_gap=CARD_GAP * scale,
-            section_gap=SECTION_GAP * scale,
+            section_gap=self.section_gap * scale,
             card_height=layout.CARD_HEIGHT[self.kind] * scale,
             time_matchup_gap=self.time_matchup_gap * h_scale,
             icon_radius=ICON_RADIUS * scale,
@@ -267,7 +269,7 @@ class BaseCardTemplate:
     def _resolve_scale(
         self, draw: ImageDraw.ImageDraw, categorized_games: dict[str, list[TeamGame]]
     ) -> float:
-        scale = layout.compute_scale(categorized_games, self.kind, self.profile)
+        scale = layout.compute_scale(categorized_games, self.kind, self.profile, self.section_gap)
         while scale > layout.MIN_SCALE and not self._fits_at_scale(draw, categorized_games, scale):
             scale = max(layout.MIN_SCALE, scale - SCALE_SEARCH_STEP)
         return scale
@@ -339,7 +341,9 @@ class BaseCardTemplate:
 
         scale = self._resolve_scale(draw, categorized_games)
         m = self._build_metrics(scale)
-        content_height = layout.total_content_height(categorized_games, self.kind) * scale
+        content_height = (
+            layout.total_content_height(categorized_games, self.kind, self.section_gap) * scale
+        )
         content_start_y = self._resolve_content_start_y(content_height)
 
         self._draw_title(draw, content_start_y, page_idx, page_count, title)

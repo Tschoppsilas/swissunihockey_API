@@ -185,3 +185,41 @@ def test_paginate_by_category_default_capacity_matches_layout():
         categorized, kind="results", capacity=layout.FEED_PROFILE.page_capacity()
     )
     assert default_pages == explicit_pages
+
+
+def test_paginate_by_category_max_categories_caps_page_even_with_room_to_spare():
+    d = date(2026, 9, 14)
+    # Plenty of pixel capacity for all 5, but max_categories=4 should still split.
+    categorized = {
+        letter: [make_team_game(i, d) for i in range(2)] for letter in "ABCDE"
+    }
+    pages = paginate_by_category(categorized, kind="announce", max_categories=4)
+    assert list(pages[0].keys()) == ["A", "B", "C", "D"]
+    assert list(pages[1].keys()) == ["E"]
+
+
+def test_paginate_by_category_max_games_caps_page_of_high_game_count_categories():
+    d = date(2026, 9, 14)
+    # 4 categories x 3 games = 12 games; max_games=9 should stop after 3 (9 games),
+    # even though max_categories=4 alone would have allowed a 4th.
+    categorized = {
+        letter: [make_team_game(i, d) for i in range(3)] for letter in "ABCD"
+    }
+    pages = paginate_by_category(
+        categorized, kind="announce", max_categories=4, max_games=9
+    )
+    assert list(pages[0].keys()) == ["A", "B", "C"]
+    assert list(pages[1].keys()) == ["D"]
+
+
+def test_paginate_by_category_max_games_allows_full_max_categories_when_games_are_few():
+    d = date(2026, 9, 14)
+    # 4 categories x 2 games = 8 games, under max_games=9, so all 4 fit together.
+    categorized = {
+        letter: [make_team_game(i, d) for i in range(2)] for letter in "ABCD"
+    }
+    pages = paginate_by_category(
+        categorized, kind="announce", max_categories=4, max_games=9
+    )
+    assert len(pages) == 1
+    assert list(pages[0].keys()) == ["A", "B", "C", "D"]

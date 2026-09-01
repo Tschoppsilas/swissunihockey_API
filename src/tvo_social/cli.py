@@ -112,11 +112,23 @@ def _generate_weeks(
     template_cls: type = InstagramV1Template,
     profile: layout.CanvasProfile = layout.FEED_PROFILE,
     template_kwargs: dict | None = None,
+    pagination_capacity: float | None = None,
+    section_gap: float = layout.SECTION_GAP,
+    max_categories: int | None = None,
+    max_games: int | None = None,
 ) -> None:
     template_kwargs = template_kwargs or {}
     for week_key_str, week_games in grouped_weeks.items():
         categorized = group_by_category(week_games)
-        pages = paginate_by_category(categorized, kind, profile)
+        pages = paginate_by_category(
+            categorized,
+            kind,
+            profile,
+            capacity=pagination_capacity,
+            section_gap=section_gap,
+            max_categories=max_categories,
+            max_games=max_games,
+        )
         title = _week_title(kind, week_key_str, week_games)
         click.echo(f"{week_key_str}: {len(week_games)} Spiele -> {len(pages)} Bild(er)")
         if dry_run:
@@ -212,7 +224,14 @@ def story(output_dir: Path | None, dry_run: bool) -> None:
         dry_run,
         template_cls=StoryTemplate,
         profile=layout.STORY_PROFILE,
-        template_kwargs={"missing_venue_text": cfg.missing_venue_text},
+        template_kwargs={
+            "missing_venue_text": cfg.missing_venue_text,
+            "section_gap": layout.STORY_SECTION_GAP,
+        },
+        pagination_capacity=layout.STORY_PAGINATION_CAPACITY,
+        section_gap=layout.STORY_SECTION_GAP,
+        max_categories=layout.STORY_MAX_CATEGORIES_PER_SLIDE,
+        max_games=layout.STORY_MAX_GAMES_PER_SLIDE,
     )
     _report_missing_venues(team_games)
 

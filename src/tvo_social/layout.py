@@ -31,6 +31,26 @@ STORY_PROFILE = CanvasProfile(
     name="story", canvas_size=(1080, 1920), content_top=300, content_bottom=1850
 )
 
+# Story pages deliberately don't pack anywhere near the full page_capacity()
+# above - that's what made a busy weekend look like a wall of cards. Instead,
+# pagination is capped much lower (fewer categories per slide, more slides),
+# while rendering still fills the *full* page_capacity() - the adaptive
+# scaling (MIN_SCALE..MAX_SCALE below) then blows up that smaller amount of
+# content to fill the extra room, which is what makes it "bigger and airier"
+# rather than just leaving blank space.
+STORY_PAGINATION_CAPACITY = 1300  # safety net - the two caps below normally bind first
+STORY_SECTION_GAP = 50  # vs. the default 34 - clearer separation between categories
+
+# Pure pixel height doesn't guarantee a consistent "how full does this slide
+# feel" - a slide of 4 Junioren-E categories (typically 3 games each) has
+# noticeably more content than 4 categories with the usual 2 games each,
+# even at a similar height. These two explicit caps make slide fullness
+# predictable regardless of composition: whichever is hit first ends the
+# slide. 4 categories x ~2 games is the common case; 9 games caps a slide of
+# mostly 3-game (E-Junioren) categories to 3 of them instead of 4.
+STORY_MAX_CATEGORIES_PER_SLIDE = 4
+STORY_MAX_GAMES_PER_SLIDE = 9
+
 # Category badge and (announce-only) venue pill sit side by side on one row.
 BANNER_HEIGHT = 46
 BANNER_GAP_BELOW = 8  # tight: banner row belongs visually to what follows
@@ -41,7 +61,9 @@ SECTION_GAP = 34  # looser: separates one category's block from the next
 CARD_HEIGHT: dict[str, int] = {"results": 60, "announce": 60}
 
 
-def category_height(num_games: int, kind: Literal["announce", "results"]) -> float:
+def category_height(
+    num_games: int, kind: Literal["announce", "results"], section_gap: float = SECTION_GAP
+) -> float:
     if num_games <= 0:
         return 0.0
     card_height = CARD_HEIGHT[kind]
@@ -50,30 +72,34 @@ def category_height(num_games: int, kind: Literal["announce", "results"]) -> flo
         header_height
         + num_games * card_height
         + (num_games - 1) * CARD_GAP
-        + SECTION_GAP
+        + section_gap
     )
 
 
 # When a page shows only a few categories/games (e.g. a home-tournament-only
-# post), scale everything up so the content fills the page instead of
-# clumping at the top with empty space below. Never shrinks below the
-# baseline size (1.0), and capped so a single game doesn't blow up absurdly.
+# post, or a story page deliberately capped below), scale everything up so
+# the content fills the page instead of clumping at the top with empty space
+# below. Never shrinks below the baseline size (1.0), and capped so a single
+# game doesn't blow up absurdly.
 MIN_SCALE = 1.0
 MAX_SCALE = 1.4
 
 
 def total_content_height(
-    categorized: dict[str, list], kind: Literal["announce", "results"]
+    categorized: dict[str, list],
+    kind: Literal["announce", "results"],
+    section_gap: float = SECTION_GAP,
 ) -> float:
-    return sum(category_height(len(games), kind) for games in categorized.values())
+    return sum(category_height(len(games), kind, section_gap) for games in categorized.values())
 
 
 def compute_scale(
     categorized: dict[str, list],
     kind: Literal["announce", "results"],
     profile: CanvasProfile = FEED_PROFILE,
+    section_gap: float = SECTION_GAP,
 ) -> float:
-    total = total_content_height(categorized, kind)
+    total = total_content_height(categorized, kind, section_gap)
     if total <= 0:
         return MIN_SCALE
     ideal = profile.page_capacity() / total

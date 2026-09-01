@@ -94,15 +94,24 @@ def paginate_by_category(
     kind: Literal["announce", "results"],
     profile: layout.CanvasProfile = layout.FEED_PROFILE,
     capacity: float | None = None,
+    section_gap: float = layout.SECTION_GAP,
+    max_categories: int | None = None,
+    max_games: int | None = None,
 ) -> list[dict[str, list[TeamGame]]]:
     """Split categorized games into pages (one dict per output image),
     keeping every category's games together on a single page. A category
-    that alone exceeds the capacity still gets its own (overfull) page
-    rather than being split mid-category.
+    that alone exceeds any limit still gets its own (overfull) page rather
+    than being split mid-category.
 
-    Capacity defaults to the actual pixel height available on one image of
-    the given canvas profile (see layout.py), so pagination always matches
-    what the template renders - pass an explicit capacity only for testing.
+    A new page starts as soon as adding the next category would exceed
+    *any* of: the pixel height capacity, max_categories, or max_games -
+    whichever binds first. Capacity defaults to the actual pixel height
+    available on one image of the given canvas profile (see layout.py), so
+    pagination always matches what the template renders; max_categories/
+    max_games (both unset by default) are optional additional caps so a
+    page's "fullness" stays predictable regardless of composition - e.g. a
+    category with 3 games (Junioren E) counts for more than one with 2,
+    which pixel height alone approximates but doesn't guarantee.
     """
     if capacity is None:
         capacity = profile.page_capacity()
@@ -110,15 +119,21 @@ def paginate_by_category(
     pages: list[dict[str, list[TeamGame]]] = []
     current: dict[str, list[TeamGame]] = {}
     current_height = 0.0
+    current_games = 0
 
     for category, games in categorized.items():
-        height = layout.category_height(len(games), kind)
-        if current and current_height + height > capacity:
+        height = layout.category_height(len(games), kind, section_gap)
+        exceeds_height = current_height + height > capacity
+        exceeds_categories = max_categories is not None and len(current) + 1 > max_categories
+        exceeds_games = max_games is not None and current_games + len(games) > max_games
+        if current and (exceeds_height or exceeds_categories or exceeds_games):
             pages.append(current)
             current = {}
             current_height = 0.0
+            current_games = 0
         current[category] = games
         current_height += height
+        current_games += len(games)
 
     if current:
         pages.append(current)
