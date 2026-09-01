@@ -367,7 +367,19 @@ class BaseCardTemplate:
     ) -> float:
         label = category.upper()
         text_width = draw.textlength(label, font=m.banner_font)
-        banner_width = min(text_width + 2 * m.banner_padding_x, CONTENT_WIDTH)
+        unclamped_width = text_width + 2 * m.banner_padding_x
+        if unclamped_width <= CONTENT_WIDTH:
+            # Fits as-is - draw the label directly rather than re-deriving
+            # the same width via banner_width - 2*padding, which can land a
+            # hair below text_width from float rounding and trigger a
+            # needless (and needlessly aggressive, once the ellipsis itself
+            # has to fit too) truncation.
+            banner_width = unclamped_width
+            display_label = label
+        else:
+            banner_width = CONTENT_WIDTH
+            display_label = fit_line(draw, label, m.banner_font, banner_width - 2 * m.banner_padding_x)
+
         draw.rounded_rectangle(
             [CONTENT_X, y, CONTENT_X + banner_width, y + m.banner_height],
             radius=m.banner_height / 2,
@@ -375,7 +387,7 @@ class BaseCardTemplate:
         )
         draw.text(
             (CONTENT_X + m.banner_padding_x, y + m.banner_height / 2),
-            fit_line(draw, label, m.banner_font, banner_width - 2 * m.banner_padding_x),
+            display_label,
             font=m.banner_font,
             fill=BANNER_TEXT,
             anchor="lm",
