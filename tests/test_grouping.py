@@ -189,27 +189,63 @@ def test_paginate_by_category_default_capacity_matches_layout():
 
 def test_paginate_by_category_max_categories_caps_page_even_with_room_to_spare():
     d = date(2026, 9, 14)
-    # Plenty of pixel capacity for all 5, but max_categories=4 should still split.
+    # Plenty of pixel capacity for all 5, but max_categories=4 should still
+    # split into 2 pages - balanced 3+2 rather than a maxed-out 4+1 (see the
+    # dedicated balancing tests below).
     categorized = {
         letter: [make_team_game(i, d) for i in range(2)] for letter in "ABCDE"
     }
     pages = paginate_by_category(categorized, kind="announce", max_categories=4)
-    assert list(pages[0].keys()) == ["A", "B", "C", "D"]
-    assert list(pages[1].keys()) == ["E"]
+    assert list(pages[0].keys()) == ["A", "B", "C"]
+    assert list(pages[1].keys()) == ["D", "E"]
 
 
 def test_paginate_by_category_max_games_caps_page_of_high_game_count_categories():
     d = date(2026, 9, 14)
-    # 4 categories x 3 games = 12 games; max_games=9 should stop after 3 (9 games),
-    # even though max_categories=4 alone would have allowed a 4th.
+    # 4 categories x 3 games = 12 games; a plain greedy fill would pack 3
+    # categories (9 games, right at the cap) then leave 1 alone on page 2.
+    # Balancing then kicks in: 2 pages are still needed, but split evenly
+    # as 2+2 (6 games each, both within max_games) instead of 3+1.
     categorized = {
         letter: [make_team_game(i, d) for i in range(3)] for letter in "ABCD"
     }
     pages = paginate_by_category(
         categorized, kind="announce", max_categories=4, max_games=9
     )
-    assert list(pages[0].keys()) == ["A", "B", "C"]
-    assert list(pages[1].keys()) == ["D"]
+    assert list(pages[0].keys()) == ["A", "B"]
+    assert list(pages[1].keys()) == ["C", "D"]
+
+
+def test_paginate_by_category_balances_seven_categories_into_four_plus_three():
+    d = date(2026, 9, 14)
+    # The user's own worked example: 7 categories, 2 games each. A plain
+    # greedy fill under max_categories=4 would give 4+3 here anyway (7/4
+    # rounds up to 2 pages, and greedy happens to land evenly) - this
+    # confirms the balanced path reproduces that same expected split.
+    categorized = {
+        letter: [make_team_game(i, d) for i in range(2)] for letter in "ABCDEFG"
+    }
+    pages = paginate_by_category(categorized, kind="announce", max_categories=4, max_games=20)
+    assert [len(p) for p in pages] == [4, 3]
+    assert list(pages[0].keys()) == ["A", "B", "C", "D"]
+    assert list(pages[1].keys()) == ["E", "F", "G"]
+
+
+def test_paginate_by_category_falls_back_to_greedy_when_balancing_is_infeasible():
+    d = date(2026, 9, 14)
+    # A single oversized category (5 games) can't be evenly redistributed
+    # alongside three 1-game categories within the 2 pages greedy needs
+    # under max_games=5 - balancing must fall back to the greedy result
+    # instead of silently producing more pages than were targeted.
+    categorized = {
+        "Huge": [make_team_game(i, d) for i in range(5)],
+        "A": [make_team_game(10, d)],
+        "B": [make_team_game(11, d)],
+        "C": [make_team_game(12, d)],
+    }
+    pages = paginate_by_category(categorized, kind="announce", max_games=5)
+    assert list(pages[0].keys()) == ["Huge"]
+    assert list(pages[1].keys()) == ["A", "B", "C"]
 
 
 def test_paginate_by_category_max_games_allows_full_max_categories_when_games_are_few():

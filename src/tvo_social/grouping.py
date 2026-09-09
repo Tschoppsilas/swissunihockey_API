@@ -89,6 +89,54 @@ def group_by_category(team_games: list[TeamGame]) -> dict[str, list[TeamGame]]:
     )
 
 
+def _pack_pages(
+    items: list[tuple[str, list[TeamGame], float]],
+    capacity: float,
+    max_categories: int | None,
+    max_games: int | None,
+    page_targets: list[int] | None = None,
+) -> list[dict[str, list[TeamGame]]] | None:
+    """Fill pages left to right, never splitting a category. With no
+    page_targets, each page is packed as full as the hard limits allow
+    (plain greedy). With page_targets (one category-count target per
+    intended page), a page also closes once it reaches its own target -
+    used to spread categories evenly across a known number of pages rather
+    than always maxing out early pages. Returns None if page_targets can't
+    be honored (packing needed more pages than were targeted), so the
+    caller can fall back to the plain greedy result."""
+    pages: list[dict[str, list[TeamGame]]] = []
+    current: dict[str, list[TeamGame]] = {}
+    current_height = 0.0
+    current_games = 0
+
+    for category, games, height in items:
+        page_index = len(pages)
+        target = page_targets[page_index] if page_targets and page_index < len(page_targets) else None
+
+        exceeds_height = current_height + height > capacity
+        exceeds_categories = max_categories is not None and len(current) + 1 > max_categories
+        exceeds_games = max_games is not None and current_games + len(games) > max_games
+        exceeds_target = target is not None and len(current) + 1 > target
+
+        if current and (exceeds_height or exceeds_categories or exceeds_games or exceeds_target):
+            pages.append(current)
+            current = {}
+            current_height = 0.0
+            current_games = 0
+
+        current[category] = games
+        current_height += height
+        current_games += len(games)
+
+    if current:
+        pages.append(current)
+
+    if page_targets is not None and len(pages) > len(page_targets):
+        return None
+
+    return pages
+
+
 def paginate_by_category(
     categorized: dict[str, list[TeamGame]],
     kind: Literal["announce", "results"],
@@ -112,30 +160,37 @@ def paginate_by_category(
     page's "fullness" stays predictable regardless of composition - e.g. a
     category with 3 games (Junioren E) counts for more than one with 2,
     which pixel height alone approximates but doesn't guarantee.
+
+    When either cap is set, pagination is balanced: first a plain greedy
+    pack determines the minimum number of pages needed, then categories are
+    redistributed as evenly as possible across exactly that many pages
+    (e.g. 7 categories over 2 pages -> 4+3, not 4+2+1 over 3 pages worth of
+    greedy fill followed by a nearly-empty last page) - falling back to the
+    plain greedy result if an even split isn't actually feasible within
+    that page count.
     """
     if capacity is None:
         capacity = profile.page_capacity()
 
-    pages: list[dict[str, list[TeamGame]]] = []
-    current: dict[str, list[TeamGame]] = {}
-    current_height = 0.0
-    current_games = 0
+    items = [
+        (category, games, layout.category_height(len(games), kind, section_gap))
+        for category, games in categorized.items()
+    ]
 
-    for category, games in categorized.items():
-        height = layout.category_height(len(games), kind, section_gap)
-        exceeds_height = current_height + height > capacity
-        exceeds_categories = max_categories is not None and len(current) + 1 > max_categories
-        exceeds_games = max_games is not None and current_games + len(games) > max_games
-        if current and (exceeds_height or exceeds_categories or exceeds_games):
-            pages.append(current)
-            current = {}
-            current_height = 0.0
-            current_games = 0
-        current[category] = games
-        current_height += height
-        current_games += len(games)
+    pages = _pack_pages(items, capacity, max_categories, max_games)
 
-    if current:
-        pages.append(current)
+    if (max_categories is not None or max_games is not None) and len(pages) > 1:
+        page_targets = _even_split_targets(len(items), len(pages))
+        balanced = _pack_pages(items, capacity, max_categories, max_games, page_targets)
+        if balanced is not None:
+            pages = balanced
 
     return pages
+
+
+def _even_split_targets(total_items: int, num_pages: int) -> list[int]:
+    """Category-count target per page so `total_items` split across
+    `num_pages` pages as evenly as possible, any remainder going to the
+    earliest pages (e.g. 7 over 2 -> [4, 3], 8 over 3 -> [3, 3, 2])."""
+    base, remainder = divmod(total_items, num_pages)
+    return [base + 1 if i < remainder else base for i in range(num_pages)]
