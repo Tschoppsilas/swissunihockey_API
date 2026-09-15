@@ -22,10 +22,17 @@ CARD_BG = (24, 24, 24, 255)
 CARD_TEXT = (255, 255, 255, 255)
 CARD_MUTED = (185, 185, 185, 255)
 
+# Slightly desaturated/darkened vs. a pure "material" green so it reads as
+# part of the same premium red/black/white system instead of a bright,
+# unrelated accent color.
 WIN_COLOR = (70, 200, 110, 255)
 LOSS_COLOR = (230, 65, 65, 255)
-DRAW_COLOR = (235, 180, 45, 255)
-UNKNOWN_COLOR = (255, 255, 255, 255)
+# Neutral grey rather than yellow/amber - a draw shouldn't read as a warning,
+# and amber was already the missing-venue/-result stamp's own color (would
+# have collided in meaning). Brighter than UNKNOWN_COLOR below so a real,
+# known draw reads as confidently neutral rather than "incomplete data".
+DRAW_COLOR = (165, 165, 165, 255)
+UNKNOWN_COLOR = (110, 110, 110, 255)  # muted - the stamp is the real "missing" signal
 
 RESULT_COLORS: dict[str, tuple[int, int, int, int]] = {
     "win": WIN_COLOR,
@@ -57,9 +64,15 @@ DEFAULT_TIME_MATCHUP_GAP = 48
 # warning/attention marker distinct from the club's own styling - a stamp
 # that could be mistaken for a normal design element would defeat its point.
 DEFAULT_MISSING_VENUE_TEXT = "ORT FOLGT"
+DEFAULT_MISSING_RESULT_TEXT = "RESULTAT FOLGT"
 STAMP_BG = (255, 176, 32, 235)
 STAMP_TEXT = (20, 20, 20, 255)
 STAMP_ANGLE = -10
+
+RESULT_ACCENT_WIDTH = 8  # left edge accent bar, win/loss/draw color
+RESULT_TINT_ALPHA = 100  # ~0.39 - confirmed final: strong enough that win/loss/
+# draw read as clearly green/red/amber at a glance, not just "generically darker".
+# White text over this remains high-contrast at every outcome color.
 
 # Safe content zone: below the top-left club logo, clear of the right margin.
 # Shared by every template - both feed and story canvases are 1080px wide,
@@ -154,7 +167,10 @@ class BaseCardTemplate:
         tvo_label_color: tuple[int, int, int, int] = TVO_RED_ON_DARK,
         time_matchup_gap: int = DEFAULT_TIME_MATCHUP_GAP,
         missing_venue_text: str = DEFAULT_MISSING_VENUE_TEXT,
+        missing_result_text: str = DEFAULT_MISSING_RESULT_TEXT,
         section_gap: float = SECTION_GAP,
+        result_card_tint: bool = True,
+        result_text_white: bool = True,
     ) -> None:
         self.kind = kind
         self.border_color = border_color
@@ -164,7 +180,10 @@ class BaseCardTemplate:
         self.shadow_color = shadow_color
         self.time_matchup_gap = time_matchup_gap
         self.missing_venue_text = missing_venue_text
+        self.missing_result_text = missing_result_text
         self.section_gap = section_gap
+        self.result_card_tint = result_card_tint
+        self.result_text_white = result_text_white
 
     @property
     def canvas_size(self) -> tuple[int, int]:
@@ -240,27 +259,39 @@ class BaseCardTemplate:
                 if pill_text_width + m.pill_icon_area + 2 * m.pill_padding_x > pill_available:
                     return False
 
+            if self.kind == "results":
+                pill_x = CONTENT_X + banner_width + m.pill_gap
+                pill_available = CONTENT_X + CONTENT_WIDTH - pill_x
+                date_str = format_date_range([tg.date for tg in team_games])
+                pill_text_width = draw.textlength(date_str, font=m.pill_font)
+                if pill_text_width + 2 * m.pill_padding_x > pill_available:
+                    return False
+
+                for tg in team_games:
+                    parts = self._result_line_parts(draw, tg, m, CONTENT_WIDTH - 2 * m.card_padding_x)
+                    raw_opponent = tg.opponent.upper()
+                    expected_left = TVO_LABEL if tg.is_home else raw_opponent
+                    expected_right = raw_opponent if tg.is_home else TVO_LABEL
+                    if parts["left_name"] != expected_left or parts["right_name"] != expected_right:
+                        return False
+                continue
+
             for tg in team_games:
-                if self.kind == "results":
-                    score_width = draw.textlength(tg.score_text() + "   ", font=m.score_font)
-                    needed = draw.textlength(f"VS {tg.opponent.upper()}", font=m.matchup_font)
-                    available = CONTENT_WIDTH - 2 * m.card_padding_x - score_width
-                else:
-                    time_str = tg.game.time or "TBD"
-                    time_width = draw.textlength(time_str, font=m.time_font)
-                    used = (
-                        m.card_padding_x
-                        + m.icon_radius * 2
-                        + m.icon_text_gap
-                        + time_width
-                        + m.time_matchup_gap
-                    )
-                    opponent = tg.opponent.upper()
-                    full_text = (
-                        f"{TVO_LABEL} VS {opponent}" if tg.is_home else f"{opponent} VS {TVO_LABEL}"
-                    )
-                    needed = draw.textlength(full_text, font=m.matchup_font)
-                    available = CONTENT_WIDTH - m.card_padding_x - used
+                time_str = tg.game.time or "TBD"
+                time_width = draw.textlength(time_str, font=m.time_font)
+                used = (
+                    m.card_padding_x
+                    + m.icon_radius * 2
+                    + m.icon_text_gap
+                    + time_width
+                    + m.time_matchup_gap
+                )
+                opponent = tg.opponent.upper()
+                full_text = (
+                    f"{TVO_LABEL} VS {opponent}" if tg.is_home else f"{opponent} VS {TVO_LABEL}"
+                )
+                needed = draw.textlength(full_text, font=m.matchup_font)
+                available = CONTENT_WIDTH - m.card_padding_x - used
                 if needed > available:
                     return False
 
@@ -398,6 +429,11 @@ class BaseCardTemplate:
             available = CONTENT_X + CONTENT_WIDTH - pill_x
             if available >= PILL_MIN_WIDTH:
                 self._draw_venue_pill(draw, team_games, pill_x, y, available, m)
+        elif self.kind == "results":
+            pill_x = CONTENT_X + banner_width + m.pill_gap
+            available = CONTENT_X + CONTENT_WIDTH - pill_x
+            if available >= PILL_MIN_WIDTH:
+                self._draw_date_pill(draw, team_games, pill_x, y, available, m)
 
         return y + m.banner_height + m.banner_gap_below
 
@@ -445,6 +481,40 @@ class BaseCardTemplate:
             CARD_BG,
         )
         draw.text((text_x, y + m.banner_height / 2), fitted, font=m.pill_font, fill=CARD_TEXT, anchor="lm")
+
+    def _draw_date_pill(
+        self,
+        draw: ImageDraw.ImageDraw,
+        team_games: list[TeamGame],
+        x: float,
+        y: float,
+        max_width: float,
+        m: Metrics,
+    ) -> None:
+        """Results only: date range, no venue/icon - the venue doesn't
+        matter once the game is already over."""
+        date_str = format_date_range([tg.date for tg in team_games])
+
+        available_text_width = max_width - 2 * m.pill_padding_x
+        if available_text_width < 20:
+            return
+        fitted = fit_line(draw, date_str, m.pill_font, available_text_width)
+        pill_width = min(
+            2 * m.pill_padding_x + draw.textlength(fitted, font=m.pill_font), max_width
+        )
+
+        draw.rounded_rectangle(
+            [x, y, x + pill_width, y + m.banner_height],
+            radius=m.banner_height / 2,
+            fill=CARD_BG,
+        )
+        draw.text(
+            (x + m.pill_padding_x, y + m.banner_height / 2),
+            fitted,
+            font=m.pill_font,
+            fill=CARD_TEXT,
+            anchor="lm",
+        )
 
     def _draw_segments(
         self, draw: ImageDraw.ImageDraw, x: float, y: float, segments: list[tuple[str, tuple]], font
@@ -497,12 +567,13 @@ class BaseCardTemplate:
             tile = tile.filter(ImageFilter.GaussianBlur(self.shadow_blur))
         image.paste(tile, (int(x0) - margin, int(y0) - margin), tile)
 
-    def _draw_missing_venue_stamp(
-        self, image: Image.Image, box: list[float], font
+    def _draw_stamp(
+        self, image: Image.Image, box: list[float], text: str, font
     ) -> None:
-        """A rotated attention banner across a card whose game has no venue
-        yet - deliberately loud (off-brand amber) so it can never be missed
-        when scanning a post before publishing it.
+        """A rotated attention banner across a card - used for both a
+        missing venue (announce) and a missing result (results).
+        Deliberately loud (off-brand amber) so it can never be missed when
+        scanning a post before publishing it.
 
         The tile is exactly card-sized and rotated WITHOUT expanding the
         canvas, so the diagonal band is clipped to the card itself - it can
@@ -518,7 +589,7 @@ class BaseCardTemplate:
         tile_draw.rectangle([0, band_top, card_w, band_top + band_h], fill=STAMP_BG)
         tile_draw.text(
             (card_w / 2, band_top + band_h / 2),
-            self.missing_venue_text,
+            text,
             font=font,
             fill=STAMP_TEXT,
             anchor="mm",
@@ -526,6 +597,99 @@ class BaseCardTemplate:
 
         rotated = tile.rotate(STAMP_ANGLE, resample=Image.BICUBIC)  # same size, clipped to the card
         image.paste(rotated, (int(x0), int(y0)), rotated)
+
+    def _result_line_parts(
+        self, draw: ImageDraw.ImageDraw, tg: TeamGame, m: Metrics, max_width: float
+    ) -> dict:
+        """Compute the (possibly-truncated) pieces of a results line -
+        'TEAM1 score : score TEAM2', home team first. The whole line shares
+        one color (win/loss/draw/unknown, see RESULT_COLORS) instead of
+        highlighting TV Oberwil specifically - a fixed "TVO" color read as
+        "this is a loss" on every card regardless of the actual result, so
+        the outcome itself now carries the color. Shared by the actual
+        drawing and by _fits_at_scale, so the truncation decision is made
+        exactly once."""
+        font = m.matchup_font
+        opponent = tg.opponent.upper()
+
+        if tg.is_home:
+            left_name, left_score = TVO_LABEL, tg.our_goals
+            right_name, right_score = opponent, tg.opp_goals
+        else:
+            left_name, left_score = opponent, tg.opp_goals
+            right_name, right_score = TVO_LABEL, tg.our_goals
+
+        left_score_text = "-" if left_score is None else str(left_score)
+        right_score_text = "-" if right_score is None else str(right_score)
+
+        small_gap = 8 * m.scale
+
+        reserved = (
+            draw.textlength(left_score_text, font=font)
+            + draw.textlength(right_score_text, font=font)
+            + draw.textlength(":", font=font)
+            + small_gap * 4
+        )
+        available_for_names = max(max_width - reserved, 40)
+
+        # TVO_LABEL is always the same fixed length - only the opponent's
+        # (variable-length) name ever needs truncating, same principle as
+        # the announce matchup line.
+        if tg.is_home:
+            fitted_left = left_name
+            fitted_right = fit_line(
+                draw, right_name, font, max(available_for_names - draw.textlength(left_name, font=font), 20)
+            )
+        else:
+            fitted_right = right_name
+            fitted_left = fit_line(
+                draw, left_name, font, max(available_for_names - draw.textlength(right_name, font=font), 20)
+            )
+
+        return {
+            "left_name": fitted_left,
+            "left_score_text": left_score_text,
+            "right_name": fitted_right,
+            "right_score_text": right_score_text,
+            "color": CARD_TEXT if self.result_text_white else RESULT_COLORS[tg.result_kind()],
+            "small_gap": small_gap,
+        }
+
+    def _draw_result_accent(
+        self, draw: ImageDraw.ImageDraw, box: list[float], radius: float, color, scale: float
+    ) -> None:
+        """A colored strip along the card's left edge - win/loss/draw at a
+        glance, without having to read the numbers. Kept inside the card's
+        own rounded silhouette (starting/ending one radius down/up) rather
+        than reproducing the corner curve itself."""
+        x0, y0, x1, y1 = box
+        top, bottom = y0 + radius, y1 - radius
+        if bottom <= top:
+            return
+        accent_width = min(RESULT_ACCENT_WIDTH * scale, (x1 - x0) / 2)
+        draw.rectangle([x0, top, x0 + accent_width, bottom], fill=color)
+
+    def _draw_result_tint(
+        self, image: Image.Image, box: list[float], radius: float, color
+    ) -> None:
+        """Optional flatter alternative/addition to the left accent bar: a
+        low-alpha wash of the outcome color over the whole card, on top of
+        the opaque CARD_BG fill already drawn.
+
+        A plain draw.rounded_rectangle(fill=RGBA) on the main image does NOT
+        alpha-blend a solid fill against existing pixels - it just overwrites
+        them (only antialiased edges/thin strokes blend by coverage), so a
+        low-alpha fill would come out fully saturated once the final image
+        is flattened to RGB. Drawn on a separate transparent tile and pasted
+        with itself as the mask instead - same proven technique as the soft
+        shadow - so it actually composites."""
+        x0, y0, x1, y1 = box
+        w, h = int(x1 - x0), int(y1 - y0)
+        tile = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        tile_draw = ImageDraw.Draw(tile, "RGBA")
+        tint = (color[0], color[1], color[2], RESULT_TINT_ALPHA)
+        tile_draw.rounded_rectangle([0, 0, w, h], radius=radius, fill=tint)
+        image.paste(tile, (int(x0), int(y0)), tile)
 
     def _draw_card(
         self,
@@ -550,25 +714,31 @@ class BaseCardTemplate:
         )
 
         if self.kind == "results":
-            score_text = tg.score_text()
-            score_color = RESULT_COLORS[tg.result_kind()]
-            draw.text(
-                (CONTENT_X + m.card_padding_x, y + height / 2),
-                score_text,
-                font=m.score_font,
-                fill=score_color,
-                anchor="lm",
-            )
-            score_width = draw.textlength(score_text + "   ", font=m.score_font)
-            opponent_text = f"VS {tg.opponent.upper()}"
-            remaining_width = CONTENT_WIDTH - 2 * m.card_padding_x - score_width
-            draw.text(
-                (CONTENT_X + m.card_padding_x + score_width, y + height / 2),
-                fit_line(draw, opponent_text, m.matchup_font, remaining_width),
-                font=m.matchup_font,
-                fill=CARD_TEXT,
-                anchor="lm",
-            )
+            outcome_color = RESULT_COLORS[tg.result_kind()]
+            if self.result_card_tint:
+                self._draw_result_tint(image, box, m.card_radius, outcome_color)
+            self._draw_result_accent(draw, box, m.card_radius, outcome_color, m.scale)
+
+            is_missing = tg.result_kind() == "unknown"
+            parts = self._result_line_parts(draw, tg, m, CONTENT_WIDTH - 2 * m.card_padding_x)
+            color = parts["color"]
+            cy = y + height / 2
+            cursor = CONTENT_X + m.card_padding_x
+
+            draw.text((cursor, cy), parts["left_name"], font=m.matchup_font, fill=color, anchor="lm")
+            cursor += draw.textlength(parts["left_name"], font=m.matchup_font) + parts["small_gap"]
+            draw.text((cursor, cy), parts["left_score_text"], font=m.matchup_font, fill=color, anchor="lm")
+            cursor += draw.textlength(parts["left_score_text"], font=m.matchup_font) + parts["small_gap"]
+
+            draw.text((cursor, cy), ":", font=m.matchup_font, fill=color, anchor="lm")
+            cursor += draw.textlength(":", font=m.matchup_font) + parts["small_gap"]
+
+            draw.text((cursor, cy), parts["right_score_text"], font=m.matchup_font, fill=color, anchor="lm")
+            cursor += draw.textlength(parts["right_score_text"], font=m.matchup_font) + parts["small_gap"]
+            draw.text((cursor, cy), parts["right_name"], font=m.matchup_font, fill=color, anchor="lm")
+
+            if is_missing:
+                self._draw_stamp(image, box, self.missing_result_text, m.stamp_font)
         else:
             time_str = tg.game.time or "TBD"
             icon_cx = CONTENT_X + m.card_padding_x + m.icon_radius
@@ -583,6 +753,6 @@ class BaseCardTemplate:
             self._draw_segments(draw, matchup_x, y + height / 2, segments, m.matchup_font)
 
             if not tg.game.venue:
-                self._draw_missing_venue_stamp(image, box, m.stamp_font)
+                self._draw_stamp(image, box, self.missing_venue_text, m.stamp_font)
 
         return y + height + m.card_gap

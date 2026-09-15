@@ -65,11 +65,12 @@ class ApiClient:
         status: Literal["planned", "played"],
         limit: int = 20,
         order: str = "ASC",
+        season: int | None = None,
     ) -> list[dict]:
-        data = self._get(
-            f"/teams/{team_id}/games",
-            params={"status": status, "limit": limit, "order": order},
-        )
+        params: dict[str, Any] = {"status": status, "limit": limit, "order": order}
+        if season is not None:
+            params["season"] = season
+        data = self._get(f"/teams/{team_id}/games", params=params)
         if data is None:
             return []
         return self._as_list(data.get("games", {}).get("game", []))

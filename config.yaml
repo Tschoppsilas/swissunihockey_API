@@ -9,3 +9,6 @@ home_venue: "Thomasgarten (Oberwil BL)"
 # Shown as a warning stamp on any game card whose venue isn't assigned yet,
 # and as the venue-pill fallback text for a category with no venue at all.
 missing_venue_text: "ORT FOLGT"
+# Shown as a warning stamp on a results card whose game should already have
+# been played (date passed) but has no recorded score yet.
+missing_result_text: "RESULTAT FOLGT"

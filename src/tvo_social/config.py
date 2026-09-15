@@ -18,6 +18,7 @@ class Config:
     team_cache_staleness_days: int = 7
     home_venue: str = "Thomasgarten (Oberwil BL)"
     missing_venue_text: str = "ORT FOLGT"
+    missing_result_text: str = "RESULTAT FOLGT"
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -37,6 +38,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         ),
         home_venue=raw.get("home_venue", Config.home_venue),
         missing_venue_text=raw.get("missing_venue_text", Config.missing_venue_text),
+        missing_result_text=raw.get("missing_result_text", Config.missing_result_text),
     )
 
 

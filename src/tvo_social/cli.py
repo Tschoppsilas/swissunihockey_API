@@ -32,7 +32,6 @@ from .grouping import (
     half_season_end,
     last_completed_week,
     paginate_by_category,
-    week_bounds,
 )
 from .models import Game, Team, TeamGame
 from .render import render_batches
@@ -44,7 +43,7 @@ GAMES_FETCH_LIMIT = 200
 
 
 def _fetch_team_games(
-    client: ApiClient, teams: list[Team], status: str, order: str
+    client: ApiClient, teams: list[Team], status: str, order: str, season: int | None = None
 ) -> list[TeamGame]:
     """One TeamGame per (team, game) pair - fetched from each team's own
     fixture list, independently.
@@ -63,7 +62,7 @@ def _fetch_team_games(
     team_games: list[TeamGame] = []
     for team in teams:
         raw_games = client.get_team_games(
-            team.id, status=status, limit=GAMES_FETCH_LIMIT, order=order
+            team.id, status=status, limit=GAMES_FETCH_LIMIT, order=order, season=season
         )
         for raw in raw_games:
             game = Game.from_api(raw)
@@ -95,13 +94,10 @@ def _fetch_team_games(
 
 
 def _week_title(kind: str, week_key_str: str, week_games: list[TeamGame]) -> str:
-    if kind == "announce":
-        # Games are always on a weekend, so show the actual date(s) rather
-        # than a calendar week number - see grouping.format_weekend_title.
-        return format_weekend_title(week_games, "GAME WEEKEND")
-    monday, sunday = week_bounds(week_games[0].date)
-    iso_week = week_key_str.split("-W")[1]
-    return f"Resultate KW{iso_week} ({monday:%d.%m.}-{sunday:%d.%m.})"
+    # Games are always on a weekend, so show the actual date(s) rather than
+    # a calendar week number - see grouping.format_weekend_title.
+    label = "GAME WEEKEND" if kind == "announce" else "RESULTATE"
+    return format_weekend_title(week_games, label)
 
 
 def _generate_weeks(
@@ -151,6 +147,18 @@ def _report_missing_venues(team_games: list[TeamGame]) -> None:
     for tg in sorted(missing, key=lambda tg: (tg.date, tg.game.time or "")):
         time_str = tg.game.time or "?"
         click.echo(f"  FEHLENDE HALLE: {tg.category} | {tg.date:%d.%m.%Y} {time_str} | vs {tg.opponent}")
+
+
+def _report_missing_results(missing: list[TeamGame]) -> None:
+    """Print every game that should have a result by now (date already
+    passed) but doesn't - grep for 'FEHLENDES RESULTAT:' to pull this into
+    an outer script, same pattern as _report_missing_venues."""
+    if not missing:
+        click.echo("Keine fehlenden Resultate.")
+        return
+    click.echo(f"\n[WARNUNG] {len(missing)} Spiel(e) ohne Resultat:")
+    for tg in sorted(missing, key=lambda tg: (tg.date, tg.game.time or "")):
+        click.echo(f"  FEHLENDES RESULTAT: {tg.category} | {tg.date:%d.%m.%Y} | vs {tg.opponent}")
 
 
 @click.group()
@@ -239,15 +247,24 @@ def story(output_dir: Path | None, dry_run: bool) -> None:
 @main.command()
 @click.option("--week-start", type=click.DateTime(formats=["%Y-%m-%d"]), default=None)
 @click.option("--week-end", type=click.DateTime(formats=["%Y-%m-%d"]), default=None)
+@click.option(
+    "--season",
+    type=int,
+    default=None,
+    help="Override the API season (e.g. 2025 for last season) - for testing with past data. "
+    "Without this, only the current season's games are queried.",
+)
 @click.option("--output-dir", type=click.Path(path_type=Path), default=None)
 @click.option("--dry-run", is_flag=True, default=False)
 def results(
     week_start: datetime | None,
     week_end: datetime | None,
+    season: int | None,
     output_dir: Path | None,
     dry_run: bool,
 ) -> None:
-    """Generate the results post for one week (default: last completed Mon-Sun week)."""
+    """Generate the results story post (all weekend results, every category)
+    for one week (default: last completed Mon-Sun week)."""
     if (week_start is None) != (week_end is None):
         raise click.UsageError("--week-start und --week-end müssen zusammen angegeben werden.")
 
@@ -262,8 +279,20 @@ def results(
 
     click.echo(f"Zeitraum: {start_date:%d.%m.%Y} - {end_date:%d.%m.%Y}")
 
-    team_games = _fetch_team_games(client, teams, status="played", order="DESC")
-    team_games = [tg for tg in team_games if start_date <= tg.date <= end_date]
+    played = _fetch_team_games(client, teams, status="played", order="DESC", season=season)
+    played = [tg for tg in played if start_date <= tg.date <= end_date]
+
+    # A game the API still calls "planned" but whose date has already
+    # passed has no result yet - merge those in too (as "unknown" outcome,
+    # score_text()/result_kind() already handle missing goals gracefully)
+    # so a game never silently disappears from the post just because the
+    # league hasn't entered its score yet.
+    planned = _fetch_team_games(client, teams, status="planned", order="ASC", season=season)
+    missing = [
+        tg for tg in planned if start_date <= tg.date <= end_date and tg.date <= date.today()
+    ]
+
+    team_games = played + missing
 
     if not team_games:
         click.echo("Keine Resultate im Zeitraum gefunden.")
@@ -271,7 +300,23 @@ def results(
 
     grouped_weeks = group_games_by_week(team_games)
     out_root = (output_dir or cfg.output_dir) / "results"
-    _generate_weeks("results", grouped_weeks, out_root, dry_run)
+    _generate_weeks(
+        "results",
+        grouped_weeks,
+        out_root,
+        dry_run,
+        template_cls=StoryTemplate,
+        profile=layout.STORY_PROFILE,
+        template_kwargs={
+            "missing_result_text": cfg.missing_result_text,
+            "section_gap": layout.STORY_SECTION_GAP,
+        },
+        pagination_capacity=layout.STORY_PAGINATION_CAPACITY,
+        section_gap=layout.STORY_SECTION_GAP,
+        max_categories=layout.STORY_MAX_CATEGORIES_PER_SLIDE,
+        max_games=layout.STORY_MAX_GAMES_PER_SLIDE,
+    )
+    _report_missing_results(missing)
 
 
 @main.command(name="refresh-teams")
