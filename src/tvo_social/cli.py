@@ -32,6 +32,7 @@ from .grouping import (
     half_season_end,
     last_completed_week,
     paginate_by_category,
+    upcoming_weekend,
 )
 from .models import Game, Team, TeamGame
 from .render import render_batches
@@ -317,6 +318,65 @@ def results(
         max_games=layout.STORY_MAX_GAMES_PER_SLIDE,
     )
     _report_missing_results(missing)
+
+
+@main.command()
+@click.option("--output-dir", type=click.Path(path_type=Path), default=None)
+@click.option("--dry-run", is_flag=True, default=False, help="Only print what would be generated.")
+def weekend(output_dir: Path | None, dry_run: bool) -> None:
+    """Generate the story post for just the upcoming weekend (all
+    categories), plus the home-tournament feed post too if a home game is
+    among them - the fast path for the common weekly case, vs. `announce`/
+    `story` which (re)generate every week through the half-season cutoff."""
+    cfg = load_config()
+    client = ApiClient(cfg.api_base)
+    teams = get_teams(client, cfg)
+
+    start_date, end_date = upcoming_weekend(date.today())
+    click.echo(f"Kommendes Wochenende: {start_date:%d.%m.%Y} - {end_date:%d.%m.%Y}")
+
+    team_games = _fetch_team_games(client, teams, status="planned", order="ASC")
+    team_games = [tg for tg in team_games if start_date <= tg.date <= end_date]
+
+    if not team_games:
+        click.echo("Keine Spiele am kommenden Wochenende gefunden.")
+        return
+
+    grouped_weeks = group_games_by_week(team_games)
+    story_root = (output_dir or cfg.output_dir) / "story"
+    _generate_weeks(
+        "announce",
+        grouped_weeks,
+        story_root,
+        dry_run,
+        template_cls=StoryTemplate,
+        profile=layout.STORY_PROFILE,
+        template_kwargs={
+            "missing_venue_text": cfg.missing_venue_text,
+            "section_gap": layout.STORY_SECTION_GAP,
+        },
+        pagination_capacity=layout.STORY_PAGINATION_CAPACITY,
+        section_gap=layout.STORY_SECTION_GAP,
+        max_categories=layout.STORY_MAX_CATEGORIES_PER_SLIDE,
+        max_games=layout.STORY_MAX_GAMES_PER_SLIDE,
+    )
+    _report_missing_venues(team_games)
+
+    home_games = [tg for tg in team_games if tg.game.venue == cfg.home_venue]
+    if not home_games:
+        click.echo("\nKein Heimspiel am kommenden Wochenende - kein Feed-Post noetig.")
+        return
+
+    click.echo(f"\n{len(home_games)} Heimspiel(e) gefunden - erzeuge zusaetzlich den Feed-Post.")
+    home_grouped = group_games_by_week(home_games)
+    feed_root = (output_dir or cfg.output_dir) / "announcements"
+    _generate_weeks(
+        "announce",
+        home_grouped,
+        feed_root,
+        dry_run,
+        template_kwargs={"missing_venue_text": cfg.missing_venue_text},
+    )
 
 
 @main.command(name="refresh-teams")

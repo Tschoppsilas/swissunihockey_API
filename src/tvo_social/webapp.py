@@ -4,11 +4,12 @@ import os
 import secrets
 import subprocess
 import sys
+from collections.abc import Iterator
 from html import escape
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 # Thin web UI in front of the existing CLI: every button press just shells
@@ -20,6 +21,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 OUTPUT_ROOT = REPO_ROOT / "output"
 WEB_STATIC_DIR = Path(__file__).resolve().parent / "web_static"
 BASIC_AUTH_USERNAME = "TVOberwil"
+
+# Marks the end of a streamed run for the browser to detect - "__DONE__" is
+# not something normal CLI output would ever print by coincidence.
+DONE_MARKER = "__DONE__"
 
 app = FastAPI(title="TV Oberwil Social")
 security = HTTPBasic()
@@ -37,15 +42,34 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None:
         )
 
 
-def run_cli(*args: str) -> tuple[bool, str]:
-    result = subprocess.run(
-        [sys.executable, "-m", "tvo_social.cli", *args],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    output = result.stdout + result.stderr
-    return result.returncode == 0, output
+def stream_cli(*command_lists: list[str]) -> Iterator[str]:
+    """Run one or more CLI commands in sequence, yielding output line by
+    line as it's produced (stderr interleaved with stdout in real time,
+    rather than appended afterwards) so the browser can show live progress
+    instead of a page that just hangs until the whole thing is done.
+    Stops early if a command fails; a later command only runs if the
+    previous one succeeded (mirrors `announce` then `story`)."""
+    for args in command_lists:
+        yield f"\n=== tvo-social {' '.join(args)} ===\n"
+        process = subprocess.Popen(
+            # "-u": unbuffered stdout/stderr - without it, a non-tty pipe
+            # makes CPython block-buffer output, so lines would only show up
+            # in bursts (or all at once at exit) instead of live.
+            [sys.executable, "-u", "-m", "tvo_social.cli", *args],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            yield line
+        process.wait()
+        if process.returncode != 0:
+            yield f"{DONE_MARKER}:{process.returncode}\n"
+            return
+    yield f"{DONE_MARKER}:0\n"
 
 
 def list_generated_images(category: str) -> list[Path]:
@@ -70,6 +94,17 @@ def render_gallery(category: str) -> str:
     return f"<div class='gallery'>{''.join(items)}</div>"
 
 
+def render_galleries_block() -> str:
+    return (
+        "<h2>Ankündigungen (Feed)</h2>"
+        f"<div id='gallery-announcements'>{render_gallery('announcements')}</div>"
+        "<h2>Story</h2>"
+        f"<div id='gallery-story'>{render_gallery('story')}</div>"
+        "<h2>Resultate</h2>"
+        f"<div id='gallery-results'>{render_gallery('results')}</div>"
+    )
+
+
 PAGE_TEMPLATE = """<!doctype html>
 <html lang="de">
 <head>
@@ -90,8 +125,9 @@ PAGE_TEMPLATE = """<!doctype html>
   button {{ font-size: 1.05rem; padding: 14px; border: none; border-radius: 10px;
             background: #c8102e; color: white; font-weight: 600; }}
   button:active {{ background: #a10d25; }}
+  button:disabled {{ background: #d99; }}
   pre {{ background: #1a1a1a; color: #d4d4d4; padding: 12px; border-radius: 8px;
-         overflow-x: auto; white-space: pre-wrap; font-size: 0.8rem; }}
+         overflow-x: auto; white-space: pre-wrap; font-size: 0.8rem; max-height: 40vh; }}
   .ok {{ color: #1a7d1a; font-weight: 600; }}
   .fail {{ color: #c8102e; font-weight: 600; }}
   .muted {{ color: #777; }}
@@ -99,36 +135,97 @@ PAGE_TEMPLATE = """<!doctype html>
               gap: 10px; }}
   .thumb {{ display: block; text-decoration: none; color: #333; font-size: 0.7rem; }}
   .thumb img {{ width: 100%; border-radius: 6px; display: block; }}
+  #status {{ margin: 20px 0; }}
+  .spinner {{ display: inline-block; width: 18px; height: 18px; border: 3px solid #ddd;
+              border-top-color: #c8102e; border-radius: 50%; animation: spin 0.8s linear infinite;
+              vertical-align: middle; margin-right: 8px; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .status-line {{ display: flex; align-items: center; font-weight: 600; }}
 </style>
 </head>
 <body>
 <h1>TV Oberwil Social</h1>
-<form method="post" action="/run/announce" class="buttons">
-  <button type="submit">Ankündigungen generieren</button>
-</form>
-<form method="post" action="/run/results" class="buttons">
-  <button type="submit">Resultate generieren</button>
-</form>
-{result_html}
-<h2>Ankündigungen (Feed)</h2>
-{announcements_gallery}
-<h2>Story</h2>
-{story_gallery}
-<h2>Resultate</h2>
-{results_gallery}
+<div class="buttons">
+  <button onclick="runJob('weekend')">Kommendes Wochenende</button>
+  <button onclick="runJob('results')">Resultate generieren</button>
+</div>
+<div id="status" hidden>
+  <div class="status-line"><span id="spinner" class="spinner"></span><span id="status-text"></span></div>
+  <pre id="log"></pre>
+</div>
+<div id="galleries">
+{galleries_block}
+</div>
+<script>
+const BUTTON_LABELS = {{
+  weekend: "Kommendes Wochenende",
+  results: "Resultate generieren",
+}};
+
+async function runJob(kind) {{
+  const buttons = document.querySelectorAll('.buttons button');
+  buttons.forEach(b => b.disabled = true);
+
+  const status = document.getElementById('status');
+  const spinner = document.getElementById('spinner');
+  const statusText = document.getElementById('status-text');
+  const log = document.getElementById('log');
+  status.hidden = false;
+  spinner.hidden = false;
+  statusText.textContent = (BUTTON_LABELS[kind] || kind) + ' läuft...';
+  log.textContent = '';
+
+  try {{
+    const response = await fetch('/run/' + kind, {{ method: 'POST' }});
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let done = false;
+    let exitCode = null;
+
+    while (!done) {{
+      const chunk = await reader.read();
+      done = chunk.done;
+      if (chunk.value) {{
+        buffer += decoder.decode(chunk.value, {{ stream: true }});
+        const markerIndex = buffer.indexOf('__DONE__:');
+        if (markerIndex !== -1) {{
+          log.textContent += buffer.slice(0, markerIndex);
+          const rest = buffer.slice(markerIndex).match(/__DONE__:(-?\\d+)/);
+          if (rest) exitCode = parseInt(rest[1], 10);
+          buffer = '';
+        }} else {{
+          log.textContent += buffer;
+          buffer = '';
+        }}
+        log.scrollTop = log.scrollHeight;
+      }}
+    }}
+
+    spinner.hidden = true;
+    if (exitCode === 0) {{
+      statusText.innerHTML = "<span class='ok'>Fertig</span>";
+    }} else {{
+      statusText.innerHTML = "<span class='fail'>Fehler" + (exitCode !== null ? ' (Code ' + exitCode + ')' : '') + "</span>";
+    }}
+
+    const galleriesResponse = await fetch('/partial/galleries');
+    document.getElementById('galleries').innerHTML = await galleriesResponse.text();
+  }} catch (err) {{
+    spinner.hidden = true;
+    statusText.innerHTML = "<span class='fail'>Fehler: " + err + "</span>";
+  }} finally {{
+    buttons.forEach(b => b.disabled = false);
+  }}
+}}
+</script>
 </body>
 </html>
 """
 
 
-def render_page(result_html: str = "") -> HTMLResponse:
-    html = PAGE_TEMPLATE.format(
-        result_html=result_html,
-        announcements_gallery=render_gallery("announcements"),
-        story_gallery=render_gallery("story"),
-        results_gallery=render_gallery("results"),
-    )
-    return HTMLResponse(html)
+def render_page() -> HTMLResponse:
+    return HTMLResponse(PAGE_TEMPLATE.format(galleries_block=render_galleries_block()))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -136,29 +233,19 @@ def index(_: None = Depends(require_auth)) -> HTMLResponse:
     return render_page()
 
 
-def _result_block(steps: list[tuple[str, bool, str]]) -> str:
-    parts = ["<h2>Ergebnis</h2>"]
-    for label, ok, output in steps:
-        status = "<span class='ok'>OK</span>" if ok else "<span class='fail'>FEHLER</span>"
-        parts.append(f"<p>{escape(label)}: {status}</p><pre>{escape(output)}</pre>")
-    return "".join(parts)
+@app.get("/partial/galleries", response_class=HTMLResponse)
+def partial_galleries(_: None = Depends(require_auth)) -> HTMLResponse:
+    return HTMLResponse(render_galleries_block())
 
 
-@app.post("/run/announce", response_class=HTMLResponse)
-def run_announce(_: None = Depends(require_auth)) -> HTMLResponse:
-    steps = []
-    ok, output = run_cli("announce")
-    steps.append(("announce", ok, output))
-    if ok:
-        ok2, output2 = run_cli("story")
-        steps.append(("story", ok2, output2))
-    return render_page(_result_block(steps))
+@app.post("/run/weekend")
+def run_weekend(_: None = Depends(require_auth)) -> StreamingResponse:
+    return StreamingResponse(stream_cli(["weekend"]), media_type="text/plain")
 
 
-@app.post("/run/results", response_class=HTMLResponse)
-def run_results(_: None = Depends(require_auth)) -> HTMLResponse:
-    ok, output = run_cli("results")
-    return render_page(_result_block([("results", ok, output)]))
+@app.post("/run/results")
+def run_results(_: None = Depends(require_auth)) -> StreamingResponse:
+    return StreamingResponse(stream_cli(["results"]), media_type="text/plain")
 
 
 @app.get("/files/{path:path}")

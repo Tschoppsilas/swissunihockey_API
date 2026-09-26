@@ -34,6 +34,14 @@ def last_completed_week(today: date) -> tuple[date, date]:
     return monday - timedelta(days=7), monday - timedelta(days=1)
 
 
+def upcoming_weekend(today: date) -> tuple[date, date]:
+    """(Saturday, Sunday) of the Mon-Sun week containing `today` - i.e. the
+    weekend that's coming up (or, if `today` is itself Sat/Sun, already in
+    progress), mirroring last_completed_week's use of week_bounds."""
+    _, sunday = week_bounds(today)
+    return sunday - timedelta(days=1), sunday
+
+
 def half_season_end(today: date) -> date:
     """Next Swiss-unihockey schedule cutoff: 30.06. or 31.12.
 
