@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from font_roboto import Roboto, RobotoBold
 from PIL import Image, ImageDraw, ImageFilter
 
 from .. import layout
@@ -11,8 +12,12 @@ from ..grouping import format_date_range
 from ..icons import draw_clock_icon, draw_pin_icon
 from ..models import TeamGame
 
-FONT_BOLD = "C:/Windows/Fonts/arialbd.ttf"
-FONT_REGULAR = "C:/Windows/Fonts/arial.ttf"
+# Bundled via the font-roboto package (not a Windows system path) so the
+# exact same font file with full Unicode/umlaut coverage renders identically
+# on Windows and on Linux hosts like Render - see fonts.load_font for the
+# fallback-if-missing behavior and its startup log line.
+FONT_BOLD = RobotoBold
+FONT_REGULAR = Roboto
 
 TVO_LABEL = "TV OBERWIL"
 
