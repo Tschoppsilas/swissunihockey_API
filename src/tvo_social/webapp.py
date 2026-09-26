@@ -263,6 +263,12 @@ PAGE_TEMPLATE = """<!doctype html>
               flex-shrink: 0; }}
   .checkmark {{ display: inline-block; width: 16px; color: #1a7d1a; font-weight: 900;
                 font-size: 1.1rem; line-height: 1; flex-shrink: 0; }}
+  /* Without this, [hidden] loses to the two rules above: both set
+     `display` at the same specificity as the browser's own built-in
+     hidden-attribute rule, and author styles always beat the user-agent
+     stylesheet at an equal-specificity tie - so toggling the `hidden`
+     property from JS silently did nothing for these two. */
+  .spinner[hidden], .checkmark[hidden] {{ display: none !important; }}
   @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
   .progress-track {{ background: #ddd; border-radius: 8px; height: 18px; overflow: hidden; }}
   .progress-fill {{ background: #c8102e; height: 100%; width: 0%; transition: width 0.4s ease; }}
