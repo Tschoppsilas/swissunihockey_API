@@ -18,6 +18,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 OUTPUT_ROOT = REPO_ROOT / "output"
+WEB_STATIC_DIR = Path(__file__).resolve().parent / "web_static"
 BASIC_AUTH_USERNAME = "TVOberwil"
 
 app = FastAPI(title="TV Oberwil Social")
@@ -75,6 +76,11 @@ PAGE_TEMPLATE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TV Oberwil Social</title>
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="theme-color" content="#c8102e">
 <style>
   body {{ font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 0; padding: 16px;
          background: #f5f5f5; color: #1a1a1a; }}
@@ -159,6 +165,33 @@ def run_results(_: None = Depends(require_auth)) -> HTMLResponse:
 def get_file(path: str, _: None = Depends(require_auth)) -> FileResponse:
     target = (OUTPUT_ROOT / path).resolve()
     if OUTPUT_ROOT.resolve() not in target.parents or not target.is_file():
+        raise HTTPException(404, "Datei nicht gefunden.")
+    return FileResponse(target)
+
+
+# App-icon/manifest assets - deliberately public (no require_auth): they're
+# just the club logo, and keeping them unauthenticated avoids any chance of
+# Android/Chrome's "Add to Home Screen" icon-fetching step failing to send
+# cached Basic Auth credentials.
+@app.get("/manifest.json")
+def get_manifest() -> FileResponse:
+    return FileResponse(WEB_STATIC_DIR / "manifest.json", media_type="application/manifest+json")
+
+
+@app.get("/favicon.ico")
+def get_favicon() -> FileResponse:
+    return FileResponse(WEB_STATIC_DIR / "favicon.ico")
+
+
+@app.get("/apple-touch-icon.png")
+def get_apple_touch_icon() -> FileResponse:
+    return FileResponse(WEB_STATIC_DIR / "apple-touch-icon.png")
+
+
+@app.get("/icons/{filename}")
+def get_icon(filename: str) -> FileResponse:
+    target = (WEB_STATIC_DIR / filename).resolve()
+    if WEB_STATIC_DIR.resolve() not in target.parents or not target.is_file():
         raise HTTPException(404, "Datei nicht gefunden.")
     return FileResponse(target)
 
