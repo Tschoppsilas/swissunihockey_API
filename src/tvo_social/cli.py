@@ -61,10 +61,15 @@ def _fetch_team_games(
     tvo_team_ids = set(category_by_team_id)
 
     team_games: list[TeamGame] = []
-    for team in teams:
+    for idx, team in enumerate(teams, start=1):
         raw_games = client.get_team_games(
             team.id, status=status, limit=GAMES_FETCH_LIMIT, order=order, season=season
         )
+        # Machine-parseable progress line (the webapp's polling status
+        # endpoint reads these to compute a real percentage) - this fetch
+        # loop, one HTTP call per team, is by far the slowest part of any
+        # command, so it's the one phase worth reporting incrementally.
+        click.echo(f"[progress] Team {idx}/{len(teams)} geladen (status={status})")
         for raw in raw_games:
             game = Game.from_api(raw)
             if game.canceled:

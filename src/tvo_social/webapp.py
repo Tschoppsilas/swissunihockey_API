@@ -1,30 +1,49 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import subprocess
 import sys
-from collections.abc import Iterator
+import threading
 from html import escape
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 # Thin web UI in front of the existing CLI: every button press just shells
 # out to `python -m tvo_social.cli <command>` (same entry point as
 # generate_posts.sh/generate_results.sh) so none of the image-generation
 # logic is duplicated here.
+#
+# Progress is reported via polling (GET /run/status) rather than a streamed
+# HTTP response: an earlier version streamed the subprocess output directly
+# as the HTTP response body, which worked locally but arrived all at once
+# (or not at all until the end) through Render's reverse proxy - Render
+# apparently buffers long-lived streaming responses. Polling every ~1.2s
+# uses only short, complete request/response cycles, so it can't be broken
+# by that kind of upstream buffering.
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 OUTPUT_ROOT = REPO_ROOT / "output"
 WEB_STATIC_DIR = Path(__file__).resolve().parent / "web_static"
 BASIC_AUTH_USERNAME = "TVOberwil"
 
-# Marks the end of a streamed run for the browser to detect - "__DONE__" is
-# not something normal CLI output would ever print by coincidence.
-DONE_MARKER = "__DONE__"
+JOB_COMMANDS: dict[str, list[list[str]]] = {
+    "weekend": [["weekend"]],
+    "results": [["results"]],
+}
+
+JOB_LOCK = threading.Lock()
+JOB: dict = {"kind": None, "running": False, "percent": 0, "message": "", "log": "", "done": False, "ok": None}
+
+TEAM_PROGRESS_RE = re.compile(r"\[progress\] Team (\d+)/(\d+) geladen \(status=(\w+)\)")
+WEEK_SUMMARY_RE = re.compile(r"^\d{4}-W\d+: \d+ Spiele")
+WROTE_STORY_RE = re.compile(r"geschrieben:.*[/\\]story[/\\]")
+WROTE_FEED_RE = re.compile(r"geschrieben:.*[/\\]announcements[/\\]")
+WROTE_RESULTS_RE = re.compile(r"geschrieben:.*[/\\]results[/\\]")
 
 app = FastAPI(title="TV Oberwil Social")
 security = HTTPBasic()
@@ -42,19 +61,61 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None:
         )
 
 
-def stream_cli(*command_lists: list[str]) -> Iterator[str]:
-    """Run one or more CLI commands in sequence, yielding output line by
-    line as it's produced (stderr interleaved with stdout in real time,
-    rather than appended afterwards) so the browser can show live progress
-    instead of a page that just hangs until the whole thing is done.
-    Stops early if a command fails; a later command only runs if the
-    previous one succeeded (mirrors `announce` then `story`)."""
-    for args in command_lists:
-        yield f"\n=== tvo-social {' '.join(args)} ===\n"
+def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
+    """Map one line of CLI output to a (percent, message) update, based on
+    real, already-completed steps rather than a time-based guess - fetching
+    each team's fixtures over HTTP is by far the slowest part of any
+    command, so that loop (see cli._fetch_team_games's "[progress]" lines)
+    carries most of the bar; rendering is comparatively instant."""
+    match = TEAM_PROGRESS_RE.search(line)
+    if match:
+        done, total, status = int(match[1]), int(match[2]), match[3]
+        fraction = done / total if total else 1.0
+        if kind == "results":
+            # Two fetch passes here: "played" (0-45%) then "planned" (45-85%).
+            if status == "played":
+                return 5 + round(fraction * 40), f"Lade gespielte Resultate ({done}/{total})..."
+            return 45 + round(fraction * 40), f"Lade ausstehende Spiele ({done}/{total})..."
+        return 5 + round(fraction * 70), f"Lade Spieldaten ({done}/{total})..."
+
+    if WEEK_SUMMARY_RE.search(line):
+        if kind == "results":
+            return 88, "Erstelle Resultate-Bild(er)..."
+        ctx["week_summaries"] = ctx.get("week_summaries", 0) + 1
+        if ctx["week_summaries"] == 1:
+            return 80, "Erstelle Story-Bild(er)..."
+        return 90, "Erstelle Feed-Post-Bild(er)..."
+
+    if "Heimspiel(e) gefunden" in line:
+        return 90, "Heimspiel gefunden - erstelle Feed-Post..."
+    if "Kein Heimspiel am kommenden Wochenende" in line:
+        return 98, "Kein Heimspiel - fertig."
+    if "Keine Spiele am kommenden Wochenende gefunden" in line:
+        return 100, "Keine Spiele am kommenden Wochenende gefunden."
+    if "Keine Resultate im Zeitraum gefunden" in line:
+        return 100, "Keine Resultate im Zeitraum gefunden."
+
+    if WROTE_STORY_RE.search(line):
+        return 88, "Story-Bild gespeichert."
+    if WROTE_FEED_RE.search(line):
+        return 97, "Feed-Post-Bild gespeichert."
+    if WROTE_RESULTS_RE.search(line):
+        return 95, "Resultate-Bild gespeichert."
+
+    return None
+
+
+def _run_job(kind: str) -> None:
+    with JOB_LOCK:
+        JOB.update(kind=kind, running=True, percent=2, message="Starte...", log="", done=False, ok=None)
+
+    ctx: dict = {}
+    ok = True
+    for args in JOB_COMMANDS[kind]:
         process = subprocess.Popen(
-            # "-u": unbuffered stdout/stderr - without it, a non-tty pipe
-            # makes CPython block-buffer output, so lines would only show up
-            # in bursts (or all at once at exit) instead of live.
+            # "-u": unbuffered stdout/stderr, so lines are available to read
+            # as soon as the subprocess prints them instead of sitting in a
+            # block buffer until it exits.
             [sys.executable, "-u", "-m", "tvo_social.cli", *args],
             cwd=REPO_ROOT,
             stdout=subprocess.PIPE,
@@ -64,12 +125,23 @@ def stream_cli(*command_lists: list[str]) -> Iterator[str]:
         )
         assert process.stdout is not None
         for line in process.stdout:
-            yield line
+            update = _parse_progress(kind, line, ctx)
+            with JOB_LOCK:
+                JOB["log"] += line
+                if update:
+                    JOB["percent"], JOB["message"] = update
         process.wait()
         if process.returncode != 0:
-            yield f"{DONE_MARKER}:{process.returncode}\n"
-            return
-    yield f"{DONE_MARKER}:0\n"
+            ok = False
+            break
+
+    with JOB_LOCK:
+        JOB["running"] = False
+        JOB["done"] = True
+        JOB["ok"] = ok
+        JOB["message"] = "Fertig." if ok else "Fehler."
+        if ok:
+            JOB["percent"] = 100
 
 
 def list_generated_images(category: str) -> list[Path]:
@@ -136,11 +208,14 @@ PAGE_TEMPLATE = """<!doctype html>
   .thumb {{ display: block; text-decoration: none; color: #333; font-size: 0.7rem; }}
   .thumb img {{ width: 100%; border-radius: 6px; display: block; }}
   #status {{ margin: 20px 0; }}
-  .spinner {{ display: inline-block; width: 18px; height: 18px; border: 3px solid #ddd;
+  .status-line {{ display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 6px; }}
+  .spinner {{ display: inline-block; width: 16px; height: 16px; border: 3px solid #ddd;
               border-top-color: #c8102e; border-radius: 50%; animation: spin 0.8s linear infinite;
-              vertical-align: middle; margin-right: 8px; }}
+              flex-shrink: 0; }}
   @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-  .status-line {{ display: flex; align-items: center; font-weight: 600; }}
+  .progress-track {{ background: #ddd; border-radius: 8px; height: 18px; overflow: hidden; }}
+  .progress-fill {{ background: #c8102e; height: 100%; width: 0%; transition: width 0.4s ease; }}
+  .progress-percent {{ font-size: 0.8rem; color: #555; margin: 4px 0 10px; }}
 </style>
 </head>
 <body>
@@ -151,6 +226,8 @@ PAGE_TEMPLATE = """<!doctype html>
 </div>
 <div id="status" hidden>
   <div class="status-line"><span id="spinner" class="spinner"></span><span id="status-text"></span></div>
+  <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+  <div id="progress-percent" class="progress-percent">0%</div>
   <pre id="log"></pre>
 </div>
 <div id="galleries">
@@ -162,58 +239,64 @@ const BUTTON_LABELS = {{
   results: "Resultate generieren",
 }};
 
+function renderStatus(s) {{
+  document.getElementById('progress-fill').style.width = s.percent + '%';
+  document.getElementById('progress-percent').textContent = s.percent + '%';
+  document.getElementById('log').textContent = s.log;
+  document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+  const statusText = document.getElementById('status-text');
+  if (s.done) {{
+    statusText.innerHTML = s.ok ? "<span class='ok'>Fertig</span>" : "<span class='fail'>Fehler - siehe Log</span>";
+  }} else {{
+    statusText.textContent = s.message || 'Läuft...';
+  }}
+}}
+
+async function pollStatus() {{
+  return new Promise((resolve, reject) => {{
+    const timer = setInterval(async () => {{
+      try {{
+        const r = await fetch('/run/status');
+        const s = await r.json();
+        renderStatus(s);
+        if (s.done) {{
+          clearInterval(timer);
+          resolve(s);
+        }}
+      }} catch (err) {{
+        clearInterval(timer);
+        reject(err);
+      }}
+    }}, 1200);
+  }});
+}}
+
 async function runJob(kind) {{
   const buttons = document.querySelectorAll('.buttons button');
   buttons.forEach(b => b.disabled = true);
 
   const status = document.getElementById('status');
   const spinner = document.getElementById('spinner');
-  const statusText = document.getElementById('status-text');
-  const log = document.getElementById('log');
   status.hidden = false;
   spinner.hidden = false;
-  statusText.textContent = (BUTTON_LABELS[kind] || kind) + ' läuft...';
-  log.textContent = '';
+  document.getElementById('status-text').textContent = (BUTTON_LABELS[kind] || kind) + ' wird gestartet...';
+  document.getElementById('log').textContent = '';
+  document.getElementById('progress-fill').style.width = '0%';
+  document.getElementById('progress-percent').textContent = '0%';
 
   try {{
-    const response = await fetch('/run/' + kind, {{ method: 'POST' }});
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let done = false;
-    let exitCode = null;
-
-    while (!done) {{
-      const chunk = await reader.read();
-      done = chunk.done;
-      if (chunk.value) {{
-        buffer += decoder.decode(chunk.value, {{ stream: true }});
-        const markerIndex = buffer.indexOf('__DONE__:');
-        if (markerIndex !== -1) {{
-          log.textContent += buffer.slice(0, markerIndex);
-          const rest = buffer.slice(markerIndex).match(/__DONE__:(-?\\d+)/);
-          if (rest) exitCode = parseInt(rest[1], 10);
-          buffer = '';
-        }} else {{
-          log.textContent += buffer;
-          buffer = '';
-        }}
-        log.scrollTop = log.scrollHeight;
-      }}
+    const startResponse = await fetch('/run/' + kind, {{ method: 'POST' }});
+    if (!startResponse.ok) {{
+      throw new Error(await startResponse.text());
     }}
-
+    await pollStatus();
     spinner.hidden = true;
-    if (exitCode === 0) {{
-      statusText.innerHTML = "<span class='ok'>Fertig</span>";
-    }} else {{
-      statusText.innerHTML = "<span class='fail'>Fehler" + (exitCode !== null ? ' (Code ' + exitCode + ')' : '') + "</span>";
-    }}
 
     const galleriesResponse = await fetch('/partial/galleries');
     document.getElementById('galleries').innerHTML = await galleriesResponse.text();
   }} catch (err) {{
     spinner.hidden = true;
-    statusText.innerHTML = "<span class='fail'>Fehler: " + err + "</span>";
+    document.getElementById('status-text').innerHTML = "<span class='fail'>Fehler: " + err + "</span>";
   }} finally {{
     buttons.forEach(b => b.disabled = false);
   }}
@@ -238,14 +321,21 @@ def partial_galleries(_: None = Depends(require_auth)) -> HTMLResponse:
     return HTMLResponse(render_galleries_block())
 
 
-@app.post("/run/weekend")
-def run_weekend(_: None = Depends(require_auth)) -> StreamingResponse:
-    return StreamingResponse(stream_cli(["weekend"]), media_type="text/plain")
+@app.post("/run/{kind}")
+def start_job(kind: str, _: None = Depends(require_auth)) -> dict:
+    if kind not in JOB_COMMANDS:
+        raise HTTPException(404, "Unbekannte Aktion.")
+    with JOB_LOCK:
+        if JOB["running"]:
+            raise HTTPException(409, "Es läuft bereits eine Generierung.")
+    threading.Thread(target=_run_job, args=(kind,), daemon=True).start()
+    return {"started": True}
 
 
-@app.post("/run/results")
-def run_results(_: None = Depends(require_auth)) -> StreamingResponse:
-    return StreamingResponse(stream_cli(["results"]), media_type="text/plain")
+@app.get("/run/status")
+def get_status(_: None = Depends(require_auth)) -> dict:
+    with JOB_LOCK:
+        return dict(JOB)
 
 
 @app.get("/files/{path:path}")
