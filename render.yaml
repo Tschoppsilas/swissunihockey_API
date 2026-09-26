@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: tvo-social
+    env: python
+    plan: free
+    buildCommand: pip install -e .
+    startCommand: uvicorn tvo_social.webapp:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: TVO_SOCIAL_PASSWORD
+        sync: false

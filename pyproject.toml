@@ -8,6 +8,8 @@ dependencies = [
     "Pillow>=10.0",
     "PyYAML>=6.0",
     "click>=8.1",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
 ]
 
 [project.optional-dependencies]
