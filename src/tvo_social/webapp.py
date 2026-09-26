@@ -37,7 +37,16 @@ JOB_COMMANDS: dict[str, list[list[str]]] = {
 }
 
 JOB_LOCK = threading.Lock()
-JOB: dict = {"kind": None, "running": False, "percent": 0, "message": "", "log": "", "done": False, "ok": None}
+JOB: dict = {
+    "kind": None,
+    "running": False,
+    "percent": 0,
+    "message": "",
+    "log": "",
+    "summary": "",
+    "done": False,
+    "ok": None,
+}
 
 TEAM_PROGRESS_RE = re.compile(r"\[progress\] Team (\d+)/(\d+) geladen \(status=(\w+)\)")
 WEEK_SUMMARY_RE = re.compile(r"^\d{4}-W\d+: \d+ Spiele")
@@ -107,7 +116,9 @@ def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
 
 def _run_job(kind: str) -> None:
     with JOB_LOCK:
-        JOB.update(kind=kind, running=True, percent=2, message="Starte...", log="", done=False, ok=None)
+        JOB.update(
+            kind=kind, running=True, percent=2, message="Starte...", log="", summary="", done=False, ok=None
+        )
 
     ctx: dict = {}
     ok = True
@@ -140,8 +151,47 @@ def _run_job(kind: str) -> None:
         JOB["done"] = True
         JOB["ok"] = ok
         JOB["message"] = "Fertig." if ok else "Fehler."
+        JOB["summary"] = _build_summary(kind, JOB["log"], ok)
         if ok:
             JOB["percent"] = 100
+
+
+def _build_summary(kind: str, log_text: str, ok: bool) -> str:
+    """Short, human-readable result instead of the raw CLI output - counts
+    written images and any "FEHLENDE HALLE:"/"FEHLENDES RESULTAT:" warnings
+    from the log, the same information generate_posts.sh's own end-of-run
+    summary prints, just derived from this run's log instead of grepped
+    from a temp file."""
+    if not ok:
+        return "<span class='fail'>Fehler bei der Generierung - Details siehe Render-Logs.</span>"
+
+    lines = log_text.splitlines()
+    story_count = sum(1 for l in lines if WROTE_STORY_RE.search(l))
+    feed_count = sum(1 for l in lines if WROTE_FEED_RE.search(l))
+    results_count = sum(1 for l in lines if WROTE_RESULTS_RE.search(l))
+    missing_venues = sum(1 for l in lines if "FEHLENDE HALLE:" in l)
+    missing_results = sum(1 for l in lines if "FEHLENDES RESULTAT:" in l)
+
+    def plural(n: int, noun: str) -> str:
+        return f"{n} {noun}" if n == 1 else f"{n} {noun}er"
+
+    if kind == "weekend":
+        if story_count == 0 and feed_count == 0:
+            return "Keine Spiele am kommenden Wochenende gefunden."
+        parts = [plural(story_count, "Story-Bild")]
+        if feed_count:
+            parts.append(plural(feed_count, "Feed-Post-Bild"))
+        summary = "Erzeugt: " + " + ".join(parts) + "."
+    else:
+        if results_count == 0:
+            return "Keine Resultate im Zeitraum gefunden."
+        summary = f"Erzeugt: {plural(results_count, 'Resultate-Bild')}."
+
+    if missing_venues:
+        summary += f"<div class='warn'>⚠ {missing_venues} Spiel(e) ohne Hallen-Zuweisung</div>"
+    if missing_results:
+        summary += f"<div class='warn'>⚠ {missing_results} Spiel(e) ohne Resultat</div>"
+    return summary
 
 
 def list_generated_images(category: str) -> list[Path]:
@@ -198,10 +248,9 @@ PAGE_TEMPLATE = """<!doctype html>
             background: #c8102e; color: white; font-weight: 600; }}
   button:active {{ background: #a10d25; }}
   button:disabled {{ background: #d99; }}
-  pre {{ background: #1a1a1a; color: #d4d4d4; padding: 12px; border-radius: 8px;
-         overflow-x: auto; white-space: pre-wrap; font-size: 0.8rem; max-height: 40vh; }}
   .ok {{ color: #1a7d1a; font-weight: 600; }}
   .fail {{ color: #c8102e; font-weight: 600; }}
+  .warn {{ color: #b45309; font-weight: 600; margin-top: 4px; }}
   .muted {{ color: #777; }}
   .gallery {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
               gap: 10px; }}
@@ -212,10 +261,13 @@ PAGE_TEMPLATE = """<!doctype html>
   .spinner {{ display: inline-block; width: 16px; height: 16px; border: 3px solid #ddd;
               border-top-color: #c8102e; border-radius: 50%; animation: spin 0.8s linear infinite;
               flex-shrink: 0; }}
+  .checkmark {{ display: inline-block; width: 16px; color: #1a7d1a; font-weight: 900;
+                font-size: 1.1rem; line-height: 1; flex-shrink: 0; }}
   @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
   .progress-track {{ background: #ddd; border-radius: 8px; height: 18px; overflow: hidden; }}
   .progress-fill {{ background: #c8102e; height: 100%; width: 0%; transition: width 0.4s ease; }}
   .progress-percent {{ font-size: 0.8rem; color: #555; margin: 4px 0 10px; }}
+  .summary {{ font-size: 0.95rem; }}
 </style>
 </head>
 <body>
@@ -225,10 +277,13 @@ PAGE_TEMPLATE = """<!doctype html>
   <button onclick="runJob('results')">Resultate generieren</button>
 </div>
 <div id="status" hidden>
-  <div class="status-line"><span id="spinner" class="spinner"></span><span id="status-text"></span></div>
+  <div class="status-line">
+    <span id="spinner" class="spinner"></span><span id="checkmark" class="checkmark" hidden>&#10003;</span>
+    <span id="status-text"></span>
+  </div>
   <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
   <div id="progress-percent" class="progress-percent">0%</div>
-  <pre id="log"></pre>
+  <div id="summary" class="summary"></div>
 </div>
 <div id="galleries">
 {galleries_block}
@@ -242,13 +297,20 @@ const BUTTON_LABELS = {{
 function renderStatus(s) {{
   document.getElementById('progress-fill').style.width = s.percent + '%';
   document.getElementById('progress-percent').textContent = s.percent + '%';
-  document.getElementById('log').textContent = s.log;
-  document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+  const spinner = document.getElementById('spinner');
+  const checkmark = document.getElementById('checkmark');
   const statusText = document.getElementById('status-text');
+  const summary = document.getElementById('summary');
   if (s.done) {{
-    statusText.innerHTML = s.ok ? "<span class='ok'>Fertig</span>" : "<span class='fail'>Fehler - siehe Log</span>";
+    spinner.hidden = true;
+    checkmark.hidden = !s.ok;
+    statusText.innerHTML = s.ok ? "<span class='ok'>Fertig</span>" : "<span class='fail'>Fehler</span>";
+    summary.innerHTML = s.summary || '';
   }} else {{
+    spinner.hidden = false;
+    checkmark.hidden = true;
     statusText.textContent = s.message || 'Läuft...';
+    summary.innerHTML = '';
   }}
 }}
 
@@ -276,11 +338,11 @@ async function runJob(kind) {{
   buttons.forEach(b => b.disabled = true);
 
   const status = document.getElementById('status');
-  const spinner = document.getElementById('spinner');
   status.hidden = false;
-  spinner.hidden = false;
+  document.getElementById('spinner').hidden = false;
+  document.getElementById('checkmark').hidden = true;
   document.getElementById('status-text').textContent = (BUTTON_LABELS[kind] || kind) + ' wird gestartet...';
-  document.getElementById('log').textContent = '';
+  document.getElementById('summary').innerHTML = '';
   document.getElementById('progress-fill').style.width = '0%';
   document.getElementById('progress-percent').textContent = '0%';
 
@@ -290,12 +352,11 @@ async function runJob(kind) {{
       throw new Error(await startResponse.text());
     }}
     await pollStatus();
-    spinner.hidden = true;
 
     const galleriesResponse = await fetch('/partial/galleries');
     document.getElementById('galleries').innerHTML = await galleriesResponse.text();
   }} catch (err) {{
-    spinner.hidden = true;
+    document.getElementById('spinner').hidden = true;
     document.getElementById('status-text').innerHTML = "<span class='fail'>Fehler: " + err + "</span>";
   }} finally {{
     buttons.forEach(b => b.disabled = false);
@@ -335,7 +396,9 @@ def start_job(kind: str, _: None = Depends(require_auth)) -> dict:
 @app.get("/run/status")
 def get_status(_: None = Depends(require_auth)) -> dict:
     with JOB_LOCK:
-        return dict(JOB)
+        # "log" (raw CLI output) is kept server-side only, to build the
+        # summary from - not sent to the browser, which shows the summary.
+        return {key: value for key, value in JOB.items() if key != "log"}
 
 
 @app.get("/files/{path:path}")
