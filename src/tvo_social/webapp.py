@@ -9,11 +9,16 @@ import threading
 from html import escape
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+import io
+import time
 
-from .instagram import InstagramError, check_connection
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from PIL import Image
+from pydantic import BaseModel
+
+from .instagram import InstagramError, check_connection, publish_story
 
 # Thin web UI in front of the existing CLI: every button press just shells
 # out to `python -m tvo_social.cli <command>` (same entry point as
@@ -50,7 +55,32 @@ JOB: dict = {
     "ok": None,
 }
 
-TEAM_PROGRESS_RE = re.compile(r"\[progress\] Team (\d+)/(\d+) geladen \(status=(\w+)\)")
+STORY_CATEGORIES = ("story", "results")
+MAX_STORY_IMAGES = 10
+PUBLIC_IMAGE_TTL_SECONDS = 900
+
+# Instagram fetches the image itself from a public URL, so the (Basic-Auth
+# protected) /files route can't be used. Instead each image to be posted is
+# converted to JPEG (the only format the publishing API accepts), held in
+# memory under a random 256-bit token, served unauthenticated at /p/<token>.jpg,
+# and dropped again as soon as that image's post attempt is over (or after the
+# TTL at the latest). Nothing is written to disk, nothing is guessable.
+PUBLIC_IMAGES: dict[str, tuple[bytes, float]] = {}
+PUBLIC_IMAGES_LOCK = threading.Lock()
+
+POST_LOCK = threading.Lock()
+POST_JOB: dict = {
+    "running": False,
+    "percent": 0,
+    "message": "",
+    "done": False,
+    "ok": None,
+    "total": 0,
+    "results": [],
+    "error": "",
+}
+
+TEAM_PROGRESS_RE =re.compile(r"\[progress\] Team (\d+)/(\d+) geladen \(status=(\w+)\)")
 WEEK_SUMMARY_RE = re.compile(r"^\d{4}-W\d+: \d+ Spiele")
 WROTE_STORY_RE = re.compile(r"geschrieben:.*[/\\]story[/\\]")
 WROTE_FEED_RE = re.compile(r"geschrieben:.*[/\\]announcements[/\\]")
@@ -194,6 +224,76 @@ def _build_summary(kind: str, log_text: str, ok: bool) -> str:
     if missing_results:
         summary += f"<div class='warn'>⚠ {missing_results} Spiel(e) ohne Resultat</div>"
     return summary
+
+
+def _public_base_url() -> str:
+    base = os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or ""
+    return base.rstrip("/")
+
+
+def _register_public_image(path: Path) -> str:
+    with Image.open(path) as image:
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, format="JPEG", quality=95)
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with PUBLIC_IMAGES_LOCK:
+        for key in [k for k, (_, exp) in PUBLIC_IMAGES.items() if exp < now]:
+            del PUBLIC_IMAGES[key]
+        PUBLIC_IMAGES[token] = (buffer.getvalue(), now + PUBLIC_IMAGE_TTL_SECONDS)
+    return token
+
+
+def _drop_public_image(token: str) -> None:
+    with PUBLIC_IMAGES_LOCK:
+        PUBLIC_IMAGES.pop(token, None)
+
+
+def _resolve_output_file(rel_path: str) -> Path:
+    target = (OUTPUT_ROOT / rel_path).resolve()
+    if OUTPUT_ROOT.resolve() not in target.parents or not target.is_file():
+        raise HTTPException(404, f"Datei nicht gefunden: {rel_path}")
+    return target
+
+
+def _run_post_job(files: list[Path], base_url: str) -> None:
+    total = len(files)
+    stage_fraction = {"prepare": 0.0, "container": 0.15, "processing": 0.4, "publishing": 0.85}
+    stage_text = {
+        "prepare": "Bild wird bereitgestellt",
+        "container": "Instagram-Container wird erstellt",
+        "processing": "Instagram verarbeitet das Bild",
+        "publishing": "Story wird veröffentlicht",
+    }
+    ok = True
+    error = ""
+    try:
+        for index, path in enumerate(files):
+            rel = path.relative_to(OUTPUT_ROOT).as_posix()
+
+            def update(stage: str, index: int = index) -> None:
+                with POST_LOCK:
+                    POST_JOB["percent"] = round((index + stage_fraction[stage]) / total * 100)
+                    POST_JOB["message"] = f"Story {index + 1} von {total}: {stage_text[stage]}..."
+
+            update("prepare")
+            token = _register_public_image(path)
+            try:
+                result = publish_story(f"{base_url}/p/{token}.jpg", on_stage=update)
+            finally:
+                _drop_public_image(token)
+            with POST_LOCK:
+                POST_JOB["results"].append({"path": rel, **result})
+    except InstagramError as exc:
+        ok, error = False, str(exc)
+    except Exception as exc:  # never leave the job stuck in "running"
+        ok, error = False, f"Unerwarteter Fehler: {type(exc).__name__}"
+
+    with POST_LOCK:
+        POST_JOB.update(running=False, done=True, ok=ok, error=error)
+        POST_JOB["message"] = "Fertig." if ok else "Fehler."
+        if ok:
+            POST_JOB["percent"] = 100
 
 
 def list_generated_images(category: str) -> list[Path]:
@@ -341,6 +441,15 @@ PAGE_TEMPLATE = """<!doctype html>
   </div>
   <div id="post-preview" class="post-preview"></div>
 </div>
+<div id="post-status" class="selection-bar" hidden>
+  <div class="status-line">
+    <span id="post-spinner" class="spinner"></span><span id="post-checkmark" class="checkmark" hidden>&#10003;</span>
+    <span id="post-status-text"></span>
+  </div>
+  <div class="progress-track"><div id="post-progress-fill" class="progress-fill"></div></div>
+  <div id="post-progress-percent" class="progress-percent">0%</div>
+  <div id="post-result" class="summary"></div>
+</div>
 <script>
 const BUTTON_LABELS = {{
   weekend: "Kommendes Wochenende",
@@ -470,14 +579,84 @@ function confirmAndPost(kind) {{
     return;
   }}
 
-  const label = kind === 'story' ? 'als Story' : 'als Feed-Post';
-  if (!confirm(selection.length + ' Bild(er) ' + label + ' posten?')) return;
+  if (kind === 'feed') {{
+    document.getElementById('post-preview').textContent =
+      'Feed-Posten ist noch nicht freigeschaltet.';
+    return;
+  }}
 
-  // Posting itself isn't wired up yet (comes in the next step) - this
-  // proves the selection/order data is captured correctly end to end.
   const order = selection.map((p, i) => (i + 1) + '. ' + p).join('\\n');
-  document.getElementById('post-preview').textContent =
-    'Bereit zum Posten (' + label + '), Posten-Funktion folgt als Nächstes:\\n' + order;
+  if (!confirm(selection.length + ' Bild(er) JETZT als Story auf den Vereins-Account posten?\\n\\n' +
+               order + '\\n\\nDas wird sofort öffentlich.')) return;
+  postStories();
+}}
+
+function renderPostStatus(s) {{
+  document.getElementById('post-progress-fill').style.width = s.percent + '%';
+  document.getElementById('post-progress-percent').textContent = s.percent + '%';
+  const spinner = document.getElementById('post-spinner');
+  const checkmark = document.getElementById('post-checkmark');
+  const text = document.getElementById('post-status-text');
+  const result = document.getElementById('post-result');
+  spinner.hidden = s.done;
+  checkmark.hidden = !(s.done && s.ok);
+  if (!s.done) {{
+    text.textContent = s.message || 'Läuft...';
+    result.innerHTML = '';
+    return;
+  }}
+  text.innerHTML = s.ok ? "<span class='ok'>Fertig</span>" : "<span class='fail'>Fehler</span>";
+  const lines = s.results.map(r =>
+    "<div class='ok'>&#10003; " + r.path + " - media_id " + r.media_id +
+    (r.permalink ? " - <a href='" + r.permalink + "' target='_blank'>ansehen</a>" : "") + "</div>");
+  let html = lines.join('');
+  if (s.ok) {{
+    html += "<div>" + s.results.length + " Story/Stories veröffentlicht.</div>";
+  }} else {{
+    html += "<div class='fail'>" + s.error + "</div>";
+    html += "<div class='warn'>" + s.results.length + " von " + s.total +
+            " bereits veröffentlicht - diese nicht erneut posten.</div>";
+  }}
+  result.innerHTML = html;
+}}
+
+async function postStories() {{
+  const sent = selection.slice();
+  const controls = document.querySelectorAll('.buttons button, .selection-buttons button');
+  controls.forEach(b => b.disabled = true);
+  const box = document.getElementById('post-status');
+  box.hidden = false;
+  renderPostStatus({{ percent: 0, message: 'Starte...', done: false, ok: null, results: [], total: sent.length }});
+  try {{
+    const start = await fetch('/post/story', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ paths: sent }}),
+    }});
+    if (!start.ok) {{
+      const detail = await start.json().catch(() => ({{}}));
+      throw new Error(detail.detail || start.status);
+    }}
+    let status;
+    do {{
+      await new Promise(r => setTimeout(r, 1200));
+      status = await (await fetch('/post/status')).json();
+      renderPostStatus(status);
+    }} while (!status.done);
+
+    // Posted images leave the selection so a retry after a partial failure
+    // can't post the same story twice.
+    const posted = status.results.map(r => r.path);
+    selection = selection.filter(p => !posted.includes(p));
+    renderSelection();
+  }} catch (err) {{
+    document.getElementById('post-spinner').hidden = true;
+    document.getElementById('post-status-text').innerHTML =
+      "<span class='fail'>Fehler: " + err.message + "</span>";
+  }} finally {{
+    document.querySelectorAll('.buttons button').forEach(b => b.disabled = false);
+    renderSelection();
+  }}
 }}
 
 async function checkInstagram() {{
@@ -576,12 +755,56 @@ def instagram_check_endpoint(_: None = Depends(require_auth)) -> dict:
     return {"ok": True, "message": f"Verbindung OK: @{info['username']}"}
 
 
+class StoryPostRequest(BaseModel):
+    paths: list[str]
+
+
+@app.post("/post/story")
+def start_story_post(body: StoryPostRequest, _: None = Depends(require_auth)) -> dict:
+    paths = body.paths
+    if not paths:
+        raise HTTPException(400, "Keine Bilder ausgewählt.")
+    if len(paths) > MAX_STORY_IMAGES:
+        raise HTTPException(400, f"Maximal {MAX_STORY_IMAGES} Bilder pro Durchgang.")
+    if len(set(paths)) != len(paths):
+        raise HTTPException(400, "Ein Bild ist mehrfach ausgewählt.")
+    for rel in paths:
+        if rel.split("/")[0] not in STORY_CATEGORIES:
+            raise HTTPException(400, f"Nur Story- oder Resultate-Bilder erlaubt: {rel}")
+    base_url = _public_base_url()
+    if not base_url:
+        raise HTTPException(500, "Keine öffentliche URL bekannt (RENDER_EXTERNAL_URL / PUBLIC_BASE_URL).")
+    files = [_resolve_output_file(rel) for rel in paths]
+
+    with POST_LOCK:
+        if POST_JOB["running"]:
+            raise HTTPException(409, "Es läuft bereits ein Post-Vorgang.")
+        POST_JOB.update(
+            running=True, percent=0, message="Starte...", done=False, ok=None,
+            total=len(files), results=[], error="",
+        )
+    threading.Thread(target=_run_post_job, args=(files, base_url), daemon=True).start()
+    return {"started": True}
+
+
+@app.get("/post/status")
+def get_post_status(_: None = Depends(require_auth)) -> dict:
+    with POST_LOCK:
+        return dict(POST_JOB)
+
+
+@app.get("/p/{token}.jpg")
+def get_public_image(token: str) -> Response:
+    with PUBLIC_IMAGES_LOCK:
+        entry = PUBLIC_IMAGES.get(token)
+    if not entry or entry[1] < time.time():
+        raise HTTPException(404, "Nicht gefunden.")
+    return Response(entry[0], media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
 @app.get("/files/{path:path}")
 def get_file(path: str, _: None = Depends(require_auth)) -> FileResponse:
-    target = (OUTPUT_ROOT / path).resolve()
-    if OUTPUT_ROOT.resolve() not in target.parents or not target.is_file():
-        raise HTTPException(404, "Datei nicht gefunden.")
-    return FileResponse(target)
+    return FileResponse(_resolve_output_file(path))
 
 
 # App-icon/manifest assets - deliberately public (no require_auth): they're
