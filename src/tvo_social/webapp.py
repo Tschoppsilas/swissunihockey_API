@@ -18,7 +18,14 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from PIL import Image
 from pydantic import BaseModel
 
-from .instagram import InstagramError, check_connection, publish_story
+from .instagram import (
+    CAPTION_MAX_CHARS,
+    CAROUSEL_MAX_ITEMS,
+    InstagramError,
+    check_connection,
+    publish_feed,
+    publish_story,
+)
 
 # Thin web UI in front of the existing CLI: every button press just shells
 # out to `python -m tvo_social.cli <command>` (same entry point as
@@ -56,7 +63,9 @@ JOB: dict = {
 }
 
 STORY_CATEGORIES = ("story", "results")
+FEED_CATEGORIES = ("announcements",)
 MAX_STORY_IMAGES = 10
+MAX_FEED_IMAGES = CAROUSEL_MAX_ITEMS
 PUBLIC_IMAGE_TTL_SECONDS = 900
 
 # Instagram fetches the image itself from a public URL, so the (Basic-Auth
@@ -70,6 +79,8 @@ PUBLIC_IMAGES_LOCK = threading.Lock()
 
 POST_LOCK = threading.Lock()
 POST_JOB: dict = {
+    "kind": None,
+    "posted_paths": [],
     "running": False,
     "percent": 0,
     "message": "",
@@ -284,16 +295,65 @@ def _run_post_job(files: list[Path], base_url: str) -> None:
                 _drop_public_image(token)
             with POST_LOCK:
                 POST_JOB["results"].append({"path": rel, **result})
+                POST_JOB["posted_paths"].append(rel)
     except InstagramError as exc:
         ok, error = False, str(exc)
     except Exception as exc:  # never leave the job stuck in "running"
         ok, error = False, f"Unerwarteter Fehler: {type(exc).__name__}"
+    _finish_post_job(ok, error)
 
+
+def _finish_post_job(ok: bool, error: str) -> None:
     with POST_LOCK:
         POST_JOB.update(running=False, done=True, ok=ok, error=error)
         POST_JOB["message"] = "Fertig." if ok else "Fehler."
         if ok:
             POST_JOB["percent"] = 100
+
+
+def _run_feed_job(files: list[Path], caption: str, base_url: str) -> None:
+    total = len(files)
+    kind_text = "Feed-Post" if total == 1 else f"Karussell ({total} Bilder)"
+    tokens: list[str] = []
+
+    def update(stage: str, current: int = 0, count: int = 0) -> None:
+        # Carousel: the per-image uploads fill 0-60%, then container/processing/publish.
+        if total == 1:
+            percent = {"container": 10, "processing": 40, "publishing": 85}[stage]
+        elif stage == "child":
+            percent = round((current - 1) / count * 60)
+        else:
+            percent = {"container": 62, "processing": 75, "publishing": 92}[stage]
+        text = {
+            "child": f"Bild {current} von {count} wird an Instagram übergeben",
+            "container": "Instagram-Container wird erstellt",
+            "processing": "Instagram verarbeitet den Post",
+            "publishing": "Post wird veröffentlicht",
+        }[stage]
+        with POST_LOCK:
+            POST_JOB["percent"] = percent
+            POST_JOB["message"] = f"{kind_text}: {text}..."
+
+    ok = True
+    error = ""
+    try:
+        with POST_LOCK:
+            POST_JOB["message"] = f"{kind_text}: Bilder werden bereitgestellt..."
+        tokens = [_register_public_image(path) for path in files]
+        urls = [f"{base_url}/p/{token}.jpg" for token in tokens]
+        result = publish_feed(urls, caption, on_stage=update)
+        rels = [path.relative_to(OUTPUT_ROOT).as_posix() for path in files]
+        with POST_LOCK:
+            POST_JOB["results"].append({"path": f"{kind_text}: " + ", ".join(rels), **result})
+            POST_JOB["posted_paths"].extend(rels)
+    except InstagramError as exc:
+        ok, error = False, str(exc)
+    except Exception as exc:  # never leave the job stuck in "running"
+        ok, error = False, f"Unerwarteter Fehler: {type(exc).__name__}"
+    finally:
+        for token in tokens:
+            _drop_public_image(token)
+    _finish_post_job(ok, error)
 
 
 def list_generated_images(category: str) -> list[Path]:
@@ -579,16 +639,23 @@ function confirmAndPost(kind) {{
     return;
   }}
 
+  const order = selection.map((p, i) => (i + 1) + '. ' + p).join('\\n');
   if (kind === 'feed') {{
-    document.getElementById('post-preview').textContent =
-      'Feed-Posten ist noch nicht freigeschaltet.';
+    const caption = document.getElementById('caption').value.trim();
+    if (caption.length > 2200) {{
+      alert('Der Text ist zu lang (' + caption.length + ' von 2200 Zeichen).');
+      return;
+    }}
+    const form = selection.length === 1 ? 'Feed-Post' : 'Feed-Post (Karussell)';
+    if (!confirm(selection.length + ' Bild(er) als ' + form + ' JETZT auf den Vereins-Account posten?\\n\\n' +
+                 order + '\\n\\nText:\\n' + (caption || '(kein Text)') + '\\n\\nDas wird sofort öffentlich.')) return;
+    runPost('feed', {{ paths: selection.slice(), caption: caption }});
     return;
   }}
 
-  const order = selection.map((p, i) => (i + 1) + '. ' + p).join('\\n');
   if (!confirm(selection.length + ' Bild(er) JETZT als Story auf den Vereins-Account posten?\\n\\n' +
                order + '\\n\\nDas wird sofort öffentlich.')) return;
-  postStories();
+  runPost('story', {{ paths: selection.slice() }});
 }}
 
 function renderPostStatus(s) {{
@@ -611,27 +678,32 @@ function renderPostStatus(s) {{
     (r.permalink ? " - <a href='" + r.permalink + "' target='_blank'>ansehen</a>" : "") + "</div>");
   let html = lines.join('');
   if (s.ok) {{
-    html += "<div>" + s.results.length + " Story/Stories veröffentlicht.</div>";
+    html += s.kind === 'feed'
+      ? "<div>Feed-Post veröffentlicht.</div>"
+      : "<div>" + s.results.length + " Story/Stories veröffentlicht.</div>";
   }} else {{
     html += "<div class='fail'>" + s.error + "</div>";
-    html += "<div class='warn'>" + s.results.length + " von " + s.total +
-            " bereits veröffentlicht - diese nicht erneut posten.</div>";
+    html += s.kind === 'feed'
+      ? "<div class='warn'>Der Post wurde nicht bestätigt. Bitte erst im Instagram-Profil prüfen, " +
+        "ob er erschienen ist, bevor du es erneut versuchst.</div>"
+      : "<div class='warn'>" + s.results.length + " von " + s.total +
+        " bereits veröffentlicht - diese nicht erneut posten.</div>";
   }}
   result.innerHTML = html;
 }}
 
-async function postStories() {{
-  const sent = selection.slice();
+async function runPost(kind, payload) {{
   const controls = document.querySelectorAll('.buttons button, .selection-buttons button');
   controls.forEach(b => b.disabled = true);
   const box = document.getElementById('post-status');
   box.hidden = false;
-  renderPostStatus({{ percent: 0, message: 'Starte...', done: false, ok: null, results: [], total: sent.length }});
+  renderPostStatus({{ percent: 0, message: 'Starte...', done: false, ok: null, results: [],
+                      total: payload.paths.length, kind: kind }});
   try {{
-    const start = await fetch('/post/story', {{
+    const start = await fetch('/post/' + kind, {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ paths: sent }}),
+      body: JSON.stringify(payload),
     }});
     if (!start.ok) {{
       const detail = await start.json().catch(() => ({{}}));
@@ -645,9 +717,9 @@ async function postStories() {{
     }} while (!status.done);
 
     // Posted images leave the selection so a retry after a partial failure
-    // can't post the same story twice.
-    const posted = status.results.map(r => r.path);
-    selection = selection.filter(p => !posted.includes(p));
+    // can't post the same image twice.
+    selection = selection.filter(p => !status.posted_paths.includes(p));
+    if (kind === 'feed' && status.ok) document.getElementById('caption').value = '';
     renderSelection();
   }} catch (err) {{
     document.getElementById('post-spinner').hidden = true;
@@ -759,18 +831,29 @@ class StoryPostRequest(BaseModel):
     paths: list[str]
 
 
-@app.post("/post/story")
-def start_story_post(body: StoryPostRequest, _: None = Depends(require_auth)) -> dict:
-    paths = body.paths
+class FeedPostRequest(BaseModel):
+    paths: list[str]
+    caption: str = ""
+
+
+def _start_post(
+    kind: str,
+    paths: list[str],
+    categories: tuple[str, ...],
+    max_count: int,
+    category_error: str,
+    target,
+    extra_args: tuple = (),
+) -> dict:
     if not paths:
         raise HTTPException(400, "Keine Bilder ausgewählt.")
-    if len(paths) > MAX_STORY_IMAGES:
-        raise HTTPException(400, f"Maximal {MAX_STORY_IMAGES} Bilder pro Durchgang.")
+    if len(paths) > max_count:
+        raise HTTPException(400, f"Maximal {max_count} Bilder pro Durchgang.")
     if len(set(paths)) != len(paths):
         raise HTTPException(400, "Ein Bild ist mehrfach ausgewählt.")
     for rel in paths:
-        if rel.split("/")[0] not in STORY_CATEGORIES:
-            raise HTTPException(400, f"Nur Story- oder Resultate-Bilder erlaubt: {rel}")
+        if rel.split("/")[0] not in categories:
+            raise HTTPException(400, f"{category_error}: {rel}")
     base_url = _public_base_url()
     if not base_url:
         raise HTTPException(500, "Keine öffentliche URL bekannt (RENDER_EXTERNAL_URL / PUBLIC_BASE_URL).")
@@ -780,11 +863,30 @@ def start_story_post(body: StoryPostRequest, _: None = Depends(require_auth)) ->
         if POST_JOB["running"]:
             raise HTTPException(409, "Es läuft bereits ein Post-Vorgang.")
         POST_JOB.update(
-            running=True, percent=0, message="Starte...", done=False, ok=None,
-            total=len(files), results=[], error="",
+            kind=kind, running=True, percent=0, message="Starte...", done=False, ok=None,
+            total=len(files), results=[], posted_paths=[], error="",
         )
-    threading.Thread(target=_run_post_job, args=(files, base_url), daemon=True).start()
+    threading.Thread(target=target, args=(files, *extra_args, base_url), daemon=True).start()
     return {"started": True}
+
+
+@app.post("/post/story")
+def start_story_post(body: StoryPostRequest, _: None = Depends(require_auth)) -> dict:
+    return _start_post(
+        "story", body.paths, STORY_CATEGORIES, MAX_STORY_IMAGES,
+        "Nur Story- oder Resultate-Bilder erlaubt", _run_post_job,
+    )
+
+
+@app.post("/post/feed")
+def start_feed_post(body: FeedPostRequest, _: None = Depends(require_auth)) -> dict:
+    caption = body.caption.strip()
+    if len(caption) > CAPTION_MAX_CHARS:
+        raise HTTPException(400, f"Der Text ist zu lang ({len(caption)} von {CAPTION_MAX_CHARS} Zeichen).")
+    return _start_post(
+        "feed", body.paths, FEED_CATEGORIES, MAX_FEED_IMAGES,
+        "Nur Ankündigungs-Bilder (Heimspiele) erlaubt", _run_feed_job, (caption,),
+    )
 
 
 @app.get("/post/status")

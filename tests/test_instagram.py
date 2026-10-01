@@ -165,3 +165,75 @@ def test_publish_limit_message(creds, monkeypatch):
     )
     with pytest.raises(InstagramError, match="Limit erreicht"):
         instagram.publish_story("https://x/p/t.jpg", sleep=lambda s: None)
+
+
+def _finished_routes(*container_ids):
+    routes = {("GET", f"/{cid}"): [FakeResponse(200, {"status_code": "FINISHED"})] for cid in container_ids}
+    routes[("POST", "/12345/media_publish")] = [FakeResponse(200, {"id": "M7"})]
+    routes[("GET", "/M7")] = [FakeResponse(200, {"permalink": "https://instagram.com/p/abc/"})]
+    return routes
+
+
+def test_publish_feed_single_image_with_caption(creds, monkeypatch):
+    routes = _finished_routes("C1")
+    routes[("POST", "/12345/media")] = [FakeResponse(200, {"id": "C1"})]
+    rec = _install(monkeypatch, routes)
+
+    result = instagram.publish_feed(["https://x/p/a.jpg"], "Hallo Welt", sleep=lambda s: None)
+
+    assert result["media_id"] == "M7"
+    creates = [c for c in rec.calls if c[0] == "POST" and c[1].endswith("/12345/media")]
+    assert len(creates) == 1
+    assert creates[0][2]["data"] == {"image_url": "https://x/p/a.jpg", "media_type": "IMAGE", "caption": "Hallo Welt"}
+
+
+def test_publish_feed_carousel_keeps_order_and_single_caption(creds, monkeypatch):
+    routes = _finished_routes("C1", "C2", "C3", "C4")
+    routes[("POST", "/12345/media")] = [
+        FakeResponse(200, {"id": "C1"}),
+        FakeResponse(200, {"id": "C2"}),
+        FakeResponse(200, {"id": "C3"}),
+        FakeResponse(200, {"id": "C4"}),
+    ]
+    rec = _install(monkeypatch, routes)
+    stages = []
+
+    instagram.publish_feed(
+        ["https://x/1.jpg", "https://x/2.jpg", "https://x/3.jpg"],
+        "Text",
+        on_stage=lambda *a: stages.append(a),
+        sleep=lambda s: None,
+    )
+
+    creates = [c[2]["data"] for c in rec.calls if c[0] == "POST" and c[1].endswith("/12345/media")]
+    assert [d["image_url"] for d in creates[:3]] == ["https://x/1.jpg", "https://x/2.jpg", "https://x/3.jpg"]
+    assert all(d["is_carousel_item"] == "true" and "caption" not in d for d in creates[:3])
+    assert creates[3] == {"media_type": "CAROUSEL", "children": "C1,C2,C3", "caption": "Text"}
+    publish = [c for c in rec.calls if c[1].endswith("media_publish")]
+    assert len(publish) == 1 and publish[0][2]["data"] == {"creation_id": "C4"}
+    assert [s[0] for s in stages] == ["child", "child", "child", "container", "processing", "publishing"]
+    assert stages[0] == ("child", 1, 3) and stages[2] == ("child", 3, 3)
+
+
+def test_publish_feed_child_error_publishes_nothing(creds, monkeypatch):
+    rec = _install(
+        monkeypatch,
+        {
+            ("POST", "/12345/media"): [FakeResponse(200, {"id": "C1"}), FakeResponse(200, {"id": "C2"})],
+            ("GET", "/C1"): [FakeResponse(200, {"status_code": "FINISHED"})],
+            ("GET", "/C2"): [FakeResponse(200, {"status_code": "ERROR", "status": "bad"})],
+        },
+    )
+    with pytest.raises(InstagramError, match="bad"):
+        instagram.publish_feed(["https://x/1.jpg", "https://x/2.jpg"], "", sleep=lambda s: None)
+    assert not any(c[1].endswith("media_publish") for c in rec.calls)
+    assert len([c for c in rec.calls if c[0] == "POST"]) == 2
+
+
+def test_publish_feed_limits(creds):
+    with pytest.raises(InstagramError, match="maximal 10"):
+        instagram.publish_feed([f"https://x/{i}.jpg" for i in range(11)], "")
+    with pytest.raises(InstagramError, match="zu lang"):
+        instagram.publish_feed(["https://x/1.jpg"], "x" * 2201)
+    with pytest.raises(InstagramError):
+        instagram.publish_feed([], "")

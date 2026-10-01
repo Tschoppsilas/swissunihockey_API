@@ -11,6 +11,9 @@ GRAPH_BASE = "https://graph.instagram.com/v23.0"
 TIMEOUT_SECONDS = 20
 CONTAINER_POLL_INTERVAL = 2.0
 CONTAINER_POLL_MAX_SECONDS = 90
+CAROUSEL_MIN_ITEMS = 2
+CAROUSEL_MAX_ITEMS = 10
+CAPTION_MAX_CHARS = 2200
 
 TOKEN_HINT = (
     "Der Instagram-Token ist abgelaufen oder ungültig. Bitte einen neuen Token generieren "
@@ -18,6 +21,10 @@ TOKEN_HINT = (
 )
 RATE_LIMIT_CODES = {4, 17, 32, 613}
 PUBLISH_LIMIT_SUBCODE = 2207042
+
+# on_stage(stage, current, total): stage is one of "child" (carousel image
+# current/total), "container", "processing", "publishing".
+StageCallback = Callable[..., None]
 
 
 class InstagramError(Exception):
@@ -88,39 +95,21 @@ def check_connection() -> dict:
     return payload
 
 
-def publish_story(
-    image_url: str,
-    on_stage: Callable[[str], None] | None = None,
-    sleep: Callable[[float], None] = time.sleep,
-) -> dict:
-    """Publishes ONE image as an Instagram story: create container, wait until Instagram
-    has fetched/processed the image (FINISHED), then media_publish. Returns
-    {"media_id", "permalink"}. Deliberately never retries the publish step on its own -
-    a retry after an ambiguous failure could post the same story twice."""
-    creds = load_credentials()
-
-    def stage(name: str) -> None:
-        if on_stage:
-            on_stage(name)
-
-    stage("container")
-    container = _call(
-        "POST",
-        f"{GRAPH_BASE}/{creds.user_id}/media",
-        creds,
-        data={"image_url": image_url, "media_type": "STORIES"},
-    )
+def _create_container(creds: InstagramCredentials, data: dict) -> str:
+    container = _call("POST", f"{GRAPH_BASE}/{creds.user_id}/media", creds, data=data)
     container_id = container.get("id")
     if not container_id:
         raise InstagramError("Instagram hat keine Container-ID zurückgegeben.")
+    return container_id
 
-    stage("processing")
+
+def _wait_until_finished(creds: InstagramCredentials, container_id: str, sleep: Callable[[float], None]) -> None:
     waited = 0.0
     while True:
         status = _call("GET", f"{GRAPH_BASE}/{container_id}", creds, params={"fields": "status_code,status"})
         code = status.get("status_code")
         if code == "FINISHED":
-            break
+            return
         if code in ("ERROR", "EXPIRED"):
             detail = status.get("status") or code
             raise InstagramError(f"Instagram konnte das Bild nicht verarbeiten: {detail}")
@@ -129,7 +118,8 @@ def publish_story(
         sleep(CONTAINER_POLL_INTERVAL)
         waited += CONTAINER_POLL_INTERVAL
 
-    stage("publishing")
+
+def _publish_container(creds: InstagramCredentials, container_id: str) -> dict:
     published = _call(
         "POST", f"{GRAPH_BASE}/{creds.user_id}/media_publish", creds, data={"creation_id": container_id}
     )
@@ -145,3 +135,74 @@ def publish_story(
     except InstagramError:
         pass
     return {"media_id": media_id, "permalink": permalink}
+
+
+def publish_story(
+    image_url: str,
+    on_stage: StageCallback | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Publishes ONE image as an Instagram story: create container, wait until Instagram
+    has fetched/processed the image (FINISHED), then media_publish. Returns
+    {"media_id", "permalink"}. Deliberately never retries the publish step on its own -
+    a retry after an ambiguous failure could post the same story twice."""
+    creds = load_credentials()
+
+    def stage(name: str) -> None:
+        if on_stage:
+            on_stage(name)
+
+    stage("container")
+    container_id = _create_container(creds, {"image_url": image_url, "media_type": "STORIES"})
+    stage("processing")
+    _wait_until_finished(creds, container_id, sleep)
+    stage("publishing")
+    return _publish_container(creds, container_id)
+
+
+def publish_feed(
+    image_urls: list[str],
+    caption: str,
+    on_stage: StageCallback | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict:
+    """Publishes a feed post: one image -> single post, 2-10 -> carousel in the given
+    order, with one shared caption. Same safety rules as publish_story: nothing is
+    published unless every container reached FINISHED, and the publish step is never
+    retried automatically."""
+    if not image_urls:
+        raise InstagramError("Keine Bilder zum Posten.")
+    if len(image_urls) > CAROUSEL_MAX_ITEMS:
+        raise InstagramError(f"Ein Karussell erlaubt maximal {CAROUSEL_MAX_ITEMS} Bilder.")
+    if len(caption) > CAPTION_MAX_CHARS:
+        raise InstagramError(f"Der Text ist zu lang ({len(caption)} von {CAPTION_MAX_CHARS} Zeichen).")
+    creds = load_credentials()
+
+    def stage(name: str, current: int = 0, total: int = 0) -> None:
+        if on_stage:
+            on_stage(name, current, total)
+
+    if len(image_urls) == 1:
+        stage("container")
+        data = {"image_url": image_urls[0], "media_type": "IMAGE"}
+        if caption:
+            data["caption"] = caption
+        container_id = _create_container(creds, data)
+    else:
+        child_ids = []
+        total = len(image_urls)
+        for index, url in enumerate(image_urls, start=1):
+            stage("child", index, total)
+            child_id = _create_container(creds, {"image_url": url, "is_carousel_item": "true"})
+            _wait_until_finished(creds, child_id, sleep)
+            child_ids.append(child_id)
+        stage("container")
+        data = {"media_type": "CAROUSEL", "children": ",".join(child_ids)}
+        if caption:
+            data["caption"] = caption
+        container_id = _create_container(creds, data)
+
+    stage("processing")
+    _wait_until_finished(creds, container_id, sleep)
+    stage("publishing")
+    return _publish_container(creds, container_id)
