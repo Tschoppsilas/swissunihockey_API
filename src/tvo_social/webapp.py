@@ -13,6 +13,8 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
+from .instagram import InstagramError, check_connection
+
 # Thin web UI in front of the existing CLI: every button press just shells
 # out to `python -m tvo_social.cli <command>` (same entry point as
 # generate_posts.sh/generate_results.sh) so none of the image-generation
@@ -312,6 +314,10 @@ PAGE_TEMPLATE = """<!doctype html>
   <button onclick="runJob('weekend')">Kommendes Wochenende</button>
   <button onclick="runJob('results')">Resultate generieren</button>
 </div>
+<div class="buttons">
+  <button id="ig-check-btn" onclick="checkInstagram()">Instagram-Verbindung testen</button>
+  <div id="ig-check-result"></div>
+</div>
 <div id="status" hidden>
   <div class="status-line">
     <span id="spinner" class="spinner"></span><span id="checkmark" class="checkmark" hidden>&#10003;</span>
@@ -474,6 +480,24 @@ function confirmAndPost(kind) {{
     'Bereit zum Posten (' + label + '), Posten-Funktion folgt als Nächstes:\\n' + order;
 }}
 
+async function checkInstagram() {{
+  const btn = document.getElementById('ig-check-btn');
+  const out = document.getElementById('ig-check-result');
+  btn.disabled = true;
+  out.textContent = 'Teste Verbindung...';
+  try {{
+    const r = await fetch('/instagram/check', {{ method: 'POST' }});
+    const d = await r.json();
+    out.textContent = d.message;
+    out.className = d.ok ? 'ok' : 'fail';
+  }} catch (err) {{
+    out.textContent = 'Fehler: ' + err;
+    out.className = 'fail';
+  }} finally {{
+    btn.disabled = false;
+  }}
+}}
+
 async function runJob(kind) {{
   const buttons = document.querySelectorAll('.buttons button');
   buttons.forEach(b => b.disabled = true);
@@ -541,6 +565,15 @@ def get_status(_: None = Depends(require_auth)) -> dict:
         # "log" (raw CLI output) is kept server-side only, to build the
         # summary from - not sent to the browser, which shows the summary.
         return {key: value for key, value in JOB.items() if key != "log"}
+
+
+@app.post("/instagram/check")
+def instagram_check_endpoint(_: None = Depends(require_auth)) -> dict:
+    try:
+        info = check_connection()
+    except InstagramError as exc:
+        return {"ok": False, "message": str(exc)}
+    return {"ok": True, "message": f"Verbindung OK: @{info['username']}"}
 
 
 @app.get("/files/{path:path}")

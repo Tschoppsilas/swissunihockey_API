@@ -395,5 +395,17 @@ def refresh_teams() -> None:
         click.echo(f"  [{team.id}] {team.name} - {team.category}")
 
 
+@main.command(name="instagram-check")
+def instagram_check() -> None:
+    """Test the Instagram connection (reads the account name, posts nothing)."""
+    from .instagram import InstagramError, check_connection
+
+    try:
+        info = check_connection()
+    except InstagramError as exc:
+        raise click.ClickException(str(exc))
+    click.echo(f"Verbindung OK: @{info['username']} ({info.get('account_type', '?')})")
+
+
 if __name__ == "__main__":
     main()

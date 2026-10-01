@@ -8,3 +8,7 @@ services:
     envVars:
       - key: TVO_SOCIAL_PASSWORD
         sync: false
+      - key: INSTAGRAM_ACCESS_TOKEN
+        sync: false
+      - key: INSTAGRAM_USER_ID
+        sync: false
