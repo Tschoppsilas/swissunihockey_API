@@ -6,6 +6,7 @@ import secrets
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from html import escape
 from pathlib import Path
 
@@ -157,7 +158,21 @@ def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
     return None
 
 
-def _run_job(kind: str) -> None:
+def _results_args(mode: str, day: str) -> list[str]:
+    """CLI arguments for the results weekend selector; validated here so only
+    known values ever reach the subprocess."""
+    if mode == "date":
+        try:
+            datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, "Bitte ein gültiges Datum wählen.")
+        return ["--date", day]
+    if mode not in ("current", "last"):
+        raise HTTPException(400, "Unbekannte Auswahl für das Wochenende.")
+    return ["--weekend", mode]
+
+
+def _run_job(kind: str, extra_args: list[str] | None = None) -> None:
     with JOB_LOCK:
         JOB.update(
             kind=kind, running=True, percent=2, message="Starte...", log="", summary="", done=False, ok=None
@@ -170,7 +185,7 @@ def _run_job(kind: str) -> None:
             # "-u": unbuffered stdout/stderr, so lines are available to read
             # as soon as the subprocess prints them instead of sitting in a
             # block buffer until it exits.
-            [sys.executable, "-u", "-m", "tvo_social.cli", *args],
+            [sys.executable, "-u", "-m", "tvo_social.cli", *args, *(extra_args or [])],
             cwd=REPO_ROOT,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -226,9 +241,17 @@ def _build_summary(kind: str, log_text: str, ok: bool) -> str:
             parts.append(plural(feed_count, "Feed-Post-Bild"))
         summary = "Erzeugt: " + " + ".join(parts) + "."
     else:
+        period = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("Zeitraum:")), "")
+        notes = [l.split(":", 1)[1].strip() for l in lines if l.startswith("Hinweis:")]
         if results_count == 0:
-            return "Keine Resultate im Zeitraum gefunden."
+            return f"Keine Resultate im Zeitraum {escape(period)} gefunden." if period else (
+                "Keine Resultate im Zeitraum gefunden."
+            )
         summary = f"Erzeugt: {plural(results_count, 'Resultate-Bild')}."
+        if period:
+            summary += f" Zeitraum: {escape(period)}."
+        for note in notes:
+            summary += f"<div class='warn'>{escape(note)}</div>"
 
     if missing_venues:
         summary += f"<div class='warn'>⚠ {missing_venues} Spiel(e) ohne Hallen-Zuweisung</div>"
@@ -413,6 +436,8 @@ PAGE_TEMPLATE = """<!doctype html>
             background: #c8102e; color: white; font-weight: 600; }}
   button:active {{ background: #a10d25; }}
   button:disabled {{ background: #d99; }}
+  .results-option {{ font-size: 1rem; padding: 12px; border: 1px solid #ccc; border-radius: 10px;
+                     background: #fff; color: #1a1a1a; width: 100%; box-sizing: border-box; }}
   .ok {{ color: #1a7d1a; font-weight: 600; }}
   .fail {{ color: #c8102e; font-weight: 600; }}
   .warn {{ color: #b45309; font-weight: 600; margin-top: 4px; }}
@@ -473,6 +498,13 @@ PAGE_TEMPLATE = """<!doctype html>
 <div class="buttons">
   <button onclick="runJob('weekend')">Kommendes Wochenende</button>
   <button onclick="runJob('results')">Resultate generieren</button>
+  <select id="results-mode" class="results-option" onchange="onResultsModeChange()"
+          aria-label="Wochenende für die Resultate">
+    <option value="current">Aktuelles Wochenende (Standard)</option>
+    <option value="last">Letztes Wochenende</option>
+    <option value="date">Datum wählen...</option>
+  </select>
+  <input type="date" id="results-day" class="results-option" hidden aria-label="Datum für die Resultate">
 </div>
 <div class="buttons">
   <button id="ig-check-btn" onclick="checkInstagram()">Instagram-Verbindung testen</button>
@@ -749,8 +781,27 @@ async function checkInstagram() {{
   }}
 }}
 
+function onResultsModeChange() {{
+  document.getElementById('results-day').hidden =
+    document.getElementById('results-mode').value !== 'date';
+}}
+
 async function runJob(kind) {{
-  const buttons = document.querySelectorAll('.buttons button');
+  let url = '/run/' + kind;
+  if (kind === 'results') {{
+    const mode = document.getElementById('results-mode').value;
+    url += '?mode=' + mode;
+    if (mode === 'date') {{
+      const day = document.getElementById('results-day').value;
+      if (!day) {{
+        alert('Bitte zuerst ein Datum wählen.');
+        return;
+      }}
+      url += '&day=' + encodeURIComponent(day);
+    }}
+  }}
+
+  const buttons = document.querySelectorAll('.buttons button, .buttons select, .buttons input');
   buttons.forEach(b => b.disabled = true);
 
   const status = document.getElementById('status');
@@ -763,7 +814,7 @@ async function runJob(kind) {{
   document.getElementById('progress-percent').textContent = '0%';
 
   try {{
-    const startResponse = await fetch('/run/' + kind, {{ method: 'POST' }});
+    const startResponse = await fetch(url, {{ method: 'POST' }});
     if (!startResponse.ok) {{
       throw new Error(await startResponse.text());
     }}
@@ -800,13 +851,16 @@ def partial_galleries(_: None = Depends(require_auth)) -> HTMLResponse:
 
 
 @app.post("/run/{kind}")
-def start_job(kind: str, _: None = Depends(require_auth)) -> dict:
+def start_job(
+    kind: str, mode: str = "current", day: str = "", _: None = Depends(require_auth)
+) -> dict:
     if kind not in JOB_COMMANDS:
         raise HTTPException(404, "Unbekannte Aktion.")
+    extra_args = _results_args(mode, day) if kind == "results" else []
     with JOB_LOCK:
         if JOB["running"]:
             raise HTTPException(409, "Es läuft bereits eine Generierung.")
-    threading.Thread(target=_run_job, args=(kind,), daemon=True).start()
+    threading.Thread(target=_run_job, args=(kind, extra_args), daemon=True).start()
     return {"started": True}
 
 

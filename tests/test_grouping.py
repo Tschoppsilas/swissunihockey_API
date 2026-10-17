@@ -259,3 +259,73 @@ def test_paginate_by_category_max_games_allows_full_max_categories_when_games_ar
     )
     assert len(pages) == 1
     assert list(pages[0].keys()) == ["A", "B", "C", "D"]
+
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from tvo_social.grouping import is_overdue, pick_results_window
+
+ZURICH = ZoneInfo("Europe/Zurich")
+
+
+def at(day: date, hour: int = 12, minute: int = 0) -> datetime:
+    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=ZURICH)
+
+
+def test_is_overdue_waits_for_game_to_be_over():
+    game = make_game(1, date(2026, 10, 17), "14:30")
+    assert not is_overdue(game, at(date(2026, 10, 17), 14, 0))  # not started
+    assert not is_overdue(game, at(date(2026, 10, 17), 15, 30))  # probably still running
+    assert is_overdue(game, at(date(2026, 10, 17), 16, 0))
+    assert is_overdue(game, at(date(2026, 10, 18), 8, 0))
+
+
+def test_is_overdue_without_time_only_after_the_day():
+    game = make_game(1, date(2026, 10, 17), "")
+    game = Game(**{**game.__dict__, "time": None})
+    assert not is_overdue(game, at(date(2026, 10, 17), 23, 0))
+    assert is_overdue(game, at(date(2026, 10, 18), 0, 5))
+
+
+def test_window_saturday_with_games_played_is_the_current_weekend():
+    now = at(date(2026, 10, 17), 14, 27)
+    window, note = pick_results_window([date(2026, 10, 17), date(2026, 10, 11)], now)
+    assert window == (date(2026, 10, 17), date(2026, 10, 18))
+    assert note is None
+
+
+def test_window_midweek_falls_back_to_latest_weekend_with_games():
+    now = at(date(2026, 10, 14))  # Wednesday
+    window, note = pick_results_window([date(2026, 10, 3), date(2026, 10, 11), date(2026, 10, 10)], now)
+    assert window == (date(2026, 10, 10), date(2026, 10, 11))
+    assert note
+
+
+def test_window_fallback_ignores_weekday_games():
+    now = at(date(2026, 10, 14))
+    window, _ = pick_results_window([date(2026, 10, 13), date(2026, 10, 4)], now)  # Tue, Sun
+    assert window == (date(2026, 10, 3), date(2026, 10, 4))
+
+
+def test_window_monday_shows_the_weekend_that_just_ended():
+    now = at(date(2026, 10, 19))  # Monday after 17./18.10.
+    window, _ = pick_results_window([date(2026, 10, 17), date(2026, 10, 18)], now)
+    assert window == (date(2026, 10, 17), date(2026, 10, 18))
+
+
+def test_window_without_any_games_is_the_current_weekend():
+    window, note = pick_results_window([], at(date(2026, 10, 14)))
+    assert window == (date(2026, 10, 17), date(2026, 10, 18))
+    assert note is None
+
+
+def test_window_last_is_the_weekend_before_this_weeks():
+    assert pick_results_window([], at(date(2026, 10, 17)), "last")[0] == (date(2026, 10, 10), date(2026, 10, 11))
+    assert pick_results_window([], at(date(2026, 10, 19)), "last")[0] == (date(2026, 10, 17), date(2026, 10, 18))
+
+
+def test_window_anchor_picks_the_weekend_of_that_week():
+    now = at(date(2026, 10, 17))
+    assert pick_results_window([], now, anchor=date(2026, 10, 11))[0] == (date(2026, 10, 10), date(2026, 10, 11))
+    assert pick_results_window([], now, anchor=date(2026, 10, 14))[0] == (date(2026, 10, 17), date(2026, 10, 18))

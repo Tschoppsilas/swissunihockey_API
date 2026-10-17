@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Generates the TV Oberwil results story post for the last completed
-# Mon-Sun weekend.
+# Generates the TV Oberwil results story post for the current weekend (all
+# games already played; falls back to the latest weekend with games if
+# nothing has been played yet this weekend).
 #
 # Run this weekly (e.g. Sunday evening after the last game) - or anytime you
-# want to (re)generate the most recent completed week's results. `announce`
+# want to (re)generate the current results. `announce`
 # and `story` (upcoming games) are NOT run here - see generate_posts.sh for
 # those.
 #
@@ -36,7 +37,7 @@ fi
 RESULTS_LOG=$(mktemp)
 trap 'rm -f "$RESULTS_LOG"' EXIT
 
-echo "--- tvo-social results (letztes abgeschlossenes Wochenende) ---"
+echo "--- tvo-social results (aktuelles Wochenende) ---"
 if ! "$TVO_SOCIAL" results | tee "$RESULTS_LOG"; then
     echo >&2
     echo "FEHLER: 'tvo-social results' ist fehlgeschlagen. Abbruch." >&2
