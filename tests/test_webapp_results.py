@@ -47,7 +47,7 @@ def test_start_job_passes_selection_to_the_job(monkeypatch):
 
 def test_page_has_the_weekend_selector():
     html = webapp.render_page().body.decode()
-    assert "Aktuelles Wochenende (Standard)" in html and "Letztes Wochenende" in html
+    assert "Aktuelle Woche (Standard)" in html and "Letzte Woche" in html
     assert 'type="date"' in html
 
 

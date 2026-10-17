@@ -498,8 +498,8 @@ PAGE_TEMPLATE = """<!doctype html>
   <button onclick="runJob('results')">Resultate generieren</button>
   <select id="results-mode" class="results-option" onchange="onResultsModeChange()"
           aria-label="Wochenende für die Resultate">
-    <option value="current">Aktuelles Wochenende (Standard)</option>
-    <option value="last">Letztes Wochenende</option>
+    <option value="current">Aktuelle Woche (Standard)</option>
+    <option value="last">Letzte Woche</option>
     <option value="date">Datum wählen...</option>
   </select>
   <input type="date" id="results-day" class="results-option" hidden aria-label="Datum für die Resultate">
