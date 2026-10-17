@@ -33,7 +33,6 @@ from .grouping import (
     group_by_category,
     group_games_by_week,
     half_season_end,
-    is_overdue,
     paginate_by_category,
     pick_results_window,
     upcoming_weekend,
@@ -270,15 +269,15 @@ def story(output_dir: Path | None, dry_run: bool) -> None:
     "weekend_mode",
     type=click.Choice(["current", "last"]),
     default="current",
-    help="current: games already played this weekend (falls back to the latest weekend "
-    "with games if none yet); last: the weekend before this week's.",
+    help="current: games played this Mon-Sun week (falls back to the latest week "
+    "with played games if none yet); last: the week before.",
 )
 @click.option(
     "--date",
     "anchor",
     type=click.DateTime(formats=["%Y-%m-%d"]),
     default=None,
-    help="Show the weekend (Sat+Sun) of the week containing this date (YYYY-MM-DD).",
+    help="Show the Mon-Sun week containing this date (YYYY-MM-DD).",
 )
 @click.option("--output-dir", type=click.Path(path_type=Path), default=None)
 @click.option("--dry-run", is_flag=True, default=False)
@@ -291,9 +290,10 @@ def results(
     output_dir: Path | None,
     dry_run: bool,
 ) -> None:
-    """Generate the results story post: every game already played (or overdue
-    without a score) on the chosen weekend, all categories. Default: the
-    current weekend, falling back to the latest weekend with games."""
+    """Generate the results story post: every game played in the chosen
+    Mon-Sun week (plus games dated today or earlier that still have no
+    score), all categories. Default: the current week, falling back to the
+    latest week with played games."""
     if (week_start is None) != (week_end is None):
         raise click.UsageError("--week-start und --week-end müssen zusammen angegeben werden.")
     if week_start is not None and anchor is not None:
@@ -307,21 +307,21 @@ def results(
     played_all = _fetch_team_games(client, teams, status="played", order="DESC", season=season)
     played_all = [tg for tg in played_all if tg.date <= now.date()]
 
-    # A game the API still calls "planned" but which should be over by now
-    # has no result yet - merge those in too (as "unknown" outcome,
-    # score_text()/result_kind() already handle missing goals gracefully)
-    # so a game never silently disappears from the post just because the
-    # league hasn't entered its score yet. Games still to be played later
-    # today are not overdue and stay out.
+    # A game the API still calls "planned" but whose date has already
+    # passed (or is today) has no result yet - merge those in too (as
+    # "unknown" outcome, score_text()/result_kind() already handle missing
+    # goals gracefully) so a game never silently disappears from the post
+    # just because the league hasn't entered its score yet.
     planned = _fetch_team_games(client, teams, status="planned", order="ASC", season=season)
-    overdue = [tg for tg in planned if is_overdue(tg.game, now)]
+    overdue = [tg for tg in planned if tg.date <= now.date()]
 
     note = None
     if week_start is not None and week_end is not None:
         start_date, end_date = week_start.date(), week_end.date()
     else:
+        # Only games with a result decide which week counts as "played".
         (start_date, end_date), note = pick_results_window(
-            [tg.date for tg in played_all + overdue],
+            [tg.date for tg in played_all],
             now,
             weekend_mode,
             anchor.date() if anchor else None,

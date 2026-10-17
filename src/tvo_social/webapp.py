@@ -241,15 +241,13 @@ def _build_summary(kind: str, log_text: str, ok: bool) -> str:
             parts.append(plural(feed_count, "Feed-Post-Bild"))
         summary = "Erzeugt: " + " + ".join(parts) + "."
     else:
-        period = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("Zeitraum:")), "")
+        titles = [l.split("Titel:", 1)[1].strip() for l in lines if l.strip().startswith("Titel:")]
         notes = [l.split(":", 1)[1].strip() for l in lines if l.startswith("Hinweis:")]
         if results_count == 0:
-            return f"Keine Resultate im Zeitraum {escape(period)} gefunden." if period else (
-                "Keine Resultate im Zeitraum gefunden."
-            )
+            return "Keine Resultate im Zeitraum gefunden."
         summary = f"Erzeugt: {plural(results_count, 'Resultate-Bild')}."
-        if period:
-            summary += f" Zeitraum: {escape(period)}."
+        if titles:
+            summary += f" ({escape(', '.join(titles))})"
         for note in notes:
             summary += f"<div class='warn'>{escape(note)}</div>"
 

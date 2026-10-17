@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 from . import layout
-from .models import Game, TeamGame
+from .models import TeamGame
 
 
 def week_bounds(d: date) -> tuple[date, date]:
@@ -42,50 +42,32 @@ def upcoming_weekend(today: date) -> tuple[date, date]:
     return sunday - timedelta(days=1), sunday
 
 
-GAME_DURATION = timedelta(minutes=90)
-
-
-def is_overdue(game: Game, now: datetime) -> bool:
-    """True once a game should be over (start + GAME_DURATION), so a game
-    that is still to be played later today is never reported as missing
-    its result. Without a start time, only a past date counts."""
-    if game.time:
-        try:
-            hour, minute = (int(part) for part in game.time.split(":")[:2])
-        except ValueError:
-            return game.date < now.date()
-        start = datetime.combine(game.date, time(hour, minute), tzinfo=now.tzinfo)
-        return now >= start + GAME_DURATION
-    return game.date < now.date()
-
-
 def pick_results_window(
     candidate_dates: list[date],
     now: datetime,
     mode: Literal["current", "last"] = "current",
     anchor: date | None = None,
 ) -> tuple[tuple[date, date], str | None]:
-    """The (Saturday, Sunday) whose results to show, plus an optional note.
+    """The (Monday, Sunday) week whose results to show, plus an optional note.
 
-    anchor: the weekend of the Mon-Sun week containing that date.
-    "last": the weekend before the current week's weekend.
-    "current": the current week's weekend, but if nothing has been played
-    there yet (e.g. Mon-Fri), the latest earlier weekend that has games.
-    candidate_dates are the dates of games that are over (played, or overdue
-    without a result)."""
-    this_weekend = upcoming_weekend(now.date())
+    anchor: the Mon-Sun week containing that date.
+    "last": the week before the current one.
+    "current": the current week, but if no game has been played in it yet,
+    the latest earlier week that has played games.
+    candidate_dates are the dates of games that have a result."""
+    this_week = week_bounds(now.date())
     if anchor is not None:
-        return upcoming_weekend(anchor), None
+        return week_bounds(anchor), None
     if mode == "last":
-        return (this_weekend[0] - timedelta(days=7), this_weekend[1] - timedelta(days=7)), None
+        return week_bounds(this_week[0] - timedelta(days=7)), None
 
-    if any(this_weekend[0] <= d <= this_weekend[1] for d in candidate_dates):
-        return this_weekend, None
-    earlier = [d for d in candidate_dates if d.weekday() >= 5 and d < this_weekend[0]]
+    if any(this_week[0] <= d <= this_week[1] for d in candidate_dates):
+        return this_week, None
+    earlier = [d for d in candidate_dates if d < this_week[0]]
     if not earlier:
-        return this_weekend, None
-    note = "Am aktuellen Wochenende wurde noch nichts gespielt - zeige das letzte Wochenende mit Spielen."
-    return upcoming_weekend(max(earlier)), note
+        return this_week, None
+    note = "Diese Woche wurde noch nichts gespielt - zeige die letzte Woche mit gespielten Spielen."
+    return week_bounds(max(earlier)), note
 
 
 def half_season_end(today: date) -> date:

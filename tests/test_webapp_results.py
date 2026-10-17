@@ -51,11 +51,12 @@ def test_page_has_the_weekend_selector():
     assert 'type="date"' in html
 
 
-def test_summary_names_the_period_and_the_fallback_note():
+def test_summary_names_the_games_period_and_the_fallback_note():
     log = (
-        "Zeitraum: 10.10.2026 - 11.10.2026\n"
-        "Hinweis: Am aktuellen Wochenende wurde noch nichts gespielt - zeige das letzte Wochenende mit Spielen.\n"
-        "2026-W41: 2 Spiele -> 1 Bild(er)\n  geschrieben: output/results/2026-W41/post_1of1.png\n"
+        "Zeitraum: 05.10.2026 - 11.10.2026\n"
+        "Hinweis: Diese Woche wurde noch nichts gespielt - zeige die letzte Woche mit gespielten Spielen.\n"
+        "2026-W41: 2 Spiele -> 1 Bild(er)\n  Titel: RESULTATE - 11.10.\n"
+        "  geschrieben: output/results/2026-W41/post_1of1.png\n"
     )
     summary = webapp._build_summary("results", log, True)
-    assert "Zeitraum: 10.10.2026 - 11.10.2026" in summary and "noch nichts gespielt" in summary
+    assert "RESULTATE - 11.10." in summary and "noch nichts gespielt" in summary
