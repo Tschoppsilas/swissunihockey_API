@@ -64,7 +64,7 @@ JOB: dict = {
 }
 
 STORY_CATEGORIES = ("story", "results")
-FEED_CATEGORIES = ("announcements",)
+FEED_CATEGORIES = ("announcements", "home_results")
 MAX_STORY_IMAGES = 10
 MAX_FEED_IMAGES = CAROUSEL_MAX_ITEMS
 PUBLIC_IMAGE_TTL_SECONDS = 900
@@ -92,10 +92,11 @@ POST_JOB: dict = {
     "error": "",
 }
 
-TEAM_PROGRESS_RE =re.compile(r"\[progress\] Team (\d+)/(\d+) geladen \(status=(\w+)\)")
+TEAM_PROGRESS_RE = re.compile(r"\[progress\] Team (\d+)/(\d+) geladen \(status=(\w+)\)")
 WEEK_SUMMARY_RE = re.compile(r"^\d{4}-W\d+: \d+ Spiele")
 WROTE_STORY_RE = re.compile(r"geschrieben:.*[/\\]story[/\\]")
 WROTE_FEED_RE = re.compile(r"geschrieben:.*[/\\]announcements[/\\]")
+WROTE_HOME_RESULTS_RE = re.compile(r"geschrieben:.*[/\\]home_results[/\\]")
 WROTE_RESULTS_RE = re.compile(r"geschrieben:.*[/\\]results[/\\]")
 
 app = FastAPI(title="TV Oberwil Social")
@@ -132,12 +133,13 @@ def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
         return 5 + round(fraction * 70), f"Lade Spieldaten ({done}/{total})..."
 
     if WEEK_SUMMARY_RE.search(line):
-        if kind == "results":
-            return 88, "Erstelle Resultate-Bild(er)..."
+        # The first summary line is always the story images, a second one
+        # (only if there were home games) the feed post.
         ctx["week_summaries"] = ctx.get("week_summaries", 0) + 1
-        if ctx["week_summaries"] == 1:
-            return 80, "Erstelle Story-Bild(er)..."
-        return 90, "Erstelle Feed-Post-Bild(er)..."
+        first = ctx["week_summaries"] == 1
+        if kind == "results":
+            return (86, "Erstelle Story-Bild(er)...") if first else (93, "Erstelle Feed-Post-Bild(er)...")
+        return (80, "Erstelle Story-Bild(er)...") if first else (90, "Erstelle Feed-Post-Bild(er)...")
 
     if "Heimspiel(e) gefunden" in line:
         return 90, "Heimspiel gefunden - erstelle Feed-Post..."
@@ -147,13 +149,17 @@ def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
         return 100, "Keine Spiele am kommenden Wochenende gefunden."
     if "Keine Resultate im Zeitraum gefunden" in line:
         return 100, "Keine Resultate im Zeitraum gefunden."
+    if "Keine Heimspiele in diesem Zeitraum" in line:
+        return 98, "Keine Heimspiele in diesem Zeitraum - fertig."
 
     if WROTE_STORY_RE.search(line):
         return 88, "Story-Bild gespeichert."
     if WROTE_FEED_RE.search(line):
         return 97, "Feed-Post-Bild gespeichert."
+    if WROTE_HOME_RESULTS_RE.search(line):
+        return 97, "Feed-Post-Bild gespeichert."
     if WROTE_RESULTS_RE.search(line):
-        return 95, "Resultate-Bild gespeichert."
+        return 89, "Story-Bild gespeichert."
 
     return None
 
@@ -227,6 +233,7 @@ def _build_summary(kind: str, log_text: str, ok: bool) -> str:
     story_count = sum(1 for l in lines if WROTE_STORY_RE.search(l))
     feed_count = sum(1 for l in lines if WROTE_FEED_RE.search(l))
     results_count = sum(1 for l in lines if WROTE_RESULTS_RE.search(l))
+    home_results_count = sum(1 for l in lines if WROTE_HOME_RESULTS_RE.search(l))
     missing_venues = sum(1 for l in lines if "FEHLENDE HALLE:" in l)
     missing_results = sum(1 for l in lines if "FEHLENDES RESULTAT:" in l)
 
@@ -245,11 +252,16 @@ def _build_summary(kind: str, log_text: str, ok: bool) -> str:
         notes = [l.split(":", 1)[1].strip() for l in lines if l.startswith("Hinweis:")]
         if results_count == 0:
             return "Keine Resultate im Zeitraum gefunden."
-        summary = f"Erzeugt: {plural(results_count, 'Resultate-Bild')}."
+        parts = [plural(results_count, "Story-Bild")]
+        if home_results_count:
+            parts.append(plural(home_results_count, "Feed-Post-Bild"))
+        summary = "Erzeugt: " + " + ".join(parts) + "."
         if titles:
             summary += f" ({escape(', '.join(titles))})"
         for note in notes:
             summary += f"<div class='warn'>{escape(note)}</div>"
+        if not home_results_count and any("Keine Heimspiele in diesem Zeitraum" in l for l in lines):
+            summary += "<div class='muted'>Keine Heimspiele in diesem Zeitraum</div>"
 
     if missing_venues:
         summary += f"<div class='warn'>⚠ {missing_venues} Spiel(e) ohne Hallen-Zuweisung</div>"
@@ -410,6 +422,8 @@ def render_galleries_block() -> str:
         f"<div id='gallery-story'>{render_gallery('story')}</div>"
         "<h2>Resultate</h2>"
         f"<div id='gallery-results'>{render_gallery('results')}</div>"
+        "<h2>Heimspiel-Resultate (Feed)</h2>"
+        f"<div id='gallery-home_results'>{render_gallery('home_results')}</div>"
     )
 
 
@@ -657,11 +671,11 @@ function confirmAndPost(kind) {{
 
   const wrongCategory = kind === 'story'
     ? selection.find(p => !['story', 'results'].includes(categoryOf(p)))
-    : selection.find(p => categoryOf(p) !== 'announcements');
+    : selection.find(p => !['announcements', 'home_results'].includes(categoryOf(p)));
   if (wrongCategory) {{
     alert(kind === 'story'
       ? 'Für "Als Story posten" bitte nur Story- oder Resultate-Bilder auswählen (nicht: ' + wrongCategory + ').'
-      : 'Für "Als Feed-Post posten" bitte nur Ankündigungs-Bilder (Heimspiele) auswählen (nicht: ' + wrongCategory + ').');
+      : 'Für "Als Feed-Post posten" bitte nur Ankündigungs- oder Heimspiel-Resultate-Bilder auswählen (nicht: ' + wrongCategory + ').');
     return;
   }}
   if (kind === 'feed' && selection.length > 10) {{
@@ -937,7 +951,7 @@ def start_feed_post(body: FeedPostRequest, _: None = Depends(require_auth)) -> d
         raise HTTPException(400, f"Der Text ist zu lang ({len(caption)} von {CAPTION_MAX_CHARS} Zeichen).")
     return _start_post(
         "feed", body.paths, FEED_CATEGORIES, MAX_FEED_IMAGES,
-        "Nur Ankündigungs-Bilder (Heimspiele) erlaubt", _run_feed_job, (caption,),
+        "Nur Feed-Bilder (Ankündigungen oder Heimspiel-Resultate) erlaubt", _run_feed_job, (caption,),
     )
 
 

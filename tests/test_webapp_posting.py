@@ -168,3 +168,36 @@ def test_feed_job_failure_posts_nothing_and_cleans_up(output, monkeypatch):
     assert webapp.POST_JOB["ok"] is False and webapp.POST_JOB["error"] == "abgelehnt"
     assert webapp.POST_JOB["posted_paths"] == [] and webapp.POST_JOB["results"] == []
     assert not webapp.PUBLIC_IMAGES and not webapp.POST_JOB["running"]
+
+
+HOME_RES_1 = "home_results/2026-W02/post_1of2.png"
+HOME_RES_2 = "home_results/2026-W02/post_2of2.png"
+
+
+def make_home_results(output):
+    for rel in (HOME_RES_1, HOME_RES_2):
+        p = output / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (1080, 1350), "green").save(p)
+
+
+def test_home_results_can_be_posted_as_feed_single_or_carousel(output):
+    make_home_results(output)
+    assert start_feed([HOME_RES_1], "Resultate") == {"started": True}
+    webapp.POST_JOB["running"] = False
+    assert start_feed([HOME_RES_1, HOME_RES_2, FEED_1], "Mix") == {"started": True}
+
+
+def test_home_results_are_rejected_as_story(output):
+    make_home_results(output)
+    with pytest.raises(HTTPException) as exc:
+        start([HOME_RES_1])
+    assert exc.value.status_code == 400
+    assert not webapp.POST_JOB["running"]
+
+
+def test_story_images_are_still_rejected_as_feed(output):
+    make_home_results(output)
+    with pytest.raises(HTTPException) as exc:
+        start_feed([HOME_RES_1, STORY_1])
+    assert exc.value.status_code == 400

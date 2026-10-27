@@ -121,6 +121,8 @@ def _generate_weeks(
     section_gap: float = layout.SECTION_GAP,
     max_categories: int | None = None,
     max_games: int | None = None,
+    balance: bool = False,
+    echo_title: bool = True,
 ) -> None:
     template_kwargs = template_kwargs or {}
     for week_key_str, week_games in grouped_weeks.items():
@@ -133,10 +135,12 @@ def _generate_weeks(
             section_gap=section_gap,
             max_categories=max_categories,
             max_games=max_games,
+            balance=balance,
         )
         title = _week_title(kind, week_key_str, week_games)
         click.echo(f"{week_key_str}: {len(week_games)} Spiele -> {len(pages)} Bild(er)")
-        click.echo(f"  Titel: {title}")
+        if echo_title:
+            click.echo(f"  Titel: {title}")
         if dry_run:
             continue
         template = template_cls(kind=kind, **template_kwargs)
@@ -292,7 +296,8 @@ def results(
 ) -> None:
     """Generate the results story post: every game played in the chosen
     Mon-Sun week (plus games dated today or earlier that still have no
-    score), all categories. Default: the current week, falling back to the
+    score), all categories - and, if there were home games, a feed post
+    with just their results. Default: the current week, falling back to the
     latest week with played games."""
     if (week_start is None) != (week_end is None):
         raise click.UsageError("--week-start und --week-end müssen zusammen angegeben werden.")
@@ -343,9 +348,10 @@ def results(
         for tg in sorted(team_games, key=lambda tg: (tg.date, tg.game.time or "", tg.category)):
             where = "heim" if tg.is_home else "aus"
             score = tg.score_text() if tg in played else "(Resultat folgt)"
+            hall = " | Heimhalle" if tg.game.venue == cfg.home_venue else ""
             click.echo(
                 f"  {tg.date:%d.%m.} {tg.game.time or '--:--'} | {tg.category} | "
-                f"{where} vs {tg.opponent} | {score}"
+                f"{where} vs {tg.opponent} | {score}{hall}"
             )
 
     grouped_weeks = group_games_by_week(team_games)
@@ -366,6 +372,24 @@ def results(
         max_categories=layout.STORY_MAX_CATEGORIES_PER_SLIDE,
         max_games=layout.STORY_MAX_GAMES_PER_SLIDE,
     )
+
+    # Feed post with the results of the home games only (same venue filter
+    # as the home-tournament announcement), in its own folder so it never
+    # overwrites the story images above.
+    home_games = [tg for tg in team_games if tg.game.venue == cfg.home_venue]
+    if not home_games:
+        click.echo("\nKeine Heimspiele in diesem Zeitraum - kein Feed-Post noetig.")
+    else:
+        click.echo(f"\n{len(home_games)} Heimspiel(e) gefunden - erzeuge zusaetzlich den Feed-Post.")
+        _generate_weeks(
+            "results",
+            group_games_by_week(home_games),
+            (output_dir or cfg.output_dir) / "home_results",
+            dry_run,
+            template_kwargs={"missing_result_text": cfg.missing_result_text},
+            balance=True,
+            echo_title=False,
+        )
     _report_missing_results(missing)
 
 

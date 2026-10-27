@@ -317,3 +317,17 @@ def test_window_anchor_is_the_whole_week_of_that_date():
     now = at(date(2026, 10, 17))
     assert pick_results_window([], now, anchor=date(2026, 10, 11))[0] == (MON_5, SUN_11)
     assert pick_results_window([], now, anchor=date(2026, 10, 14))[0] == (MON_12, SUN_18)
+
+
+def test_paginate_balance_flag_evens_out_pages_even_without_caps():
+    d = date(2026, 10, 17)
+    categorized = {
+        "A": [make_team_game(i, d) for i in range(3)],
+        "B": [make_team_game(i, d) for i in range(3, 6)],
+        "C": [make_team_game(i, d) for i in range(6, 8)],
+        "D": [make_team_game(i, d) for i in range(8, 10)],
+    }
+    greedy = paginate_by_category(categorized, kind="results")
+    balanced = paginate_by_category(categorized, kind="results", balance=True)
+    assert [len(p) for p in greedy] == [3, 1]
+    assert [len(p) for p in balanced] == [2, 2]

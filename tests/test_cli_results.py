@@ -12,10 +12,13 @@ from tvo_social.models import Game, TeamGame
 ZURICH = ZoneInfo("Europe/Zurich")
 
 
-def tg(id, d, time, category, goals=None, opponent="Gegner"):
+HOME_VENUE = "Thomasgarten (Oberwil BL)"
+
+
+def tg(id, d, time, category, goals=None, opponent="Gegner", venue="Halle"):
     game = Game(
         id=id, date=d, time=time, home_team="TV Oberwil BL", away_team=opponent,
-        home_team_id=1, away_team_id=2, venue="Halle", league_text=category, category_text=category,
+        home_team_id=1, away_team_id=2, venue=venue, league_text=category, category_text=category,
         played=goals is not None,
         goals_home=goals[0] if goals else None, goals_away=goals[1] if goals else None,
     )
@@ -37,7 +40,7 @@ PLANNED = [
 ]
 
 
-def run(monkeypatch, now, *args):
+def run(monkeypatch, now, *args, played=None, planned=None, dry_run=True):
     class FixedDatetime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -46,14 +49,18 @@ def run(monkeypatch, now, *args):
     monkeypatch.setattr(cli, "datetime", FixedDatetime)
     monkeypatch.setattr(
         cli, "load_config",
-        lambda: SimpleNamespace(api_base="http://x", output_dir=Path("out"), missing_result_text="RESULTAT FOLGT"),
+        lambda: SimpleNamespace(
+            api_base="http://x", output_dir=Path("out"), missing_result_text="RESULTAT FOLGT", home_venue=HOME_VENUE
+        ),
     )
     monkeypatch.setattr(cli, "get_teams", lambda client, cfg: [])
     monkeypatch.setattr(
         cli, "_fetch_team_games",
-        lambda client, teams, status, order, season=None: list(PLAYED if status == "played" else PLANNED),
+        lambda client, teams, status, order, season=None: list(
+            (PLAYED if played is None else played) if status == "played" else (PLANNED if planned is None else planned)
+        ),
     )
-    result = CliRunner().invoke(cli.main, ["results", "--dry-run", *args])
+    result = CliRunner().invoke(cli.main, ["results", *(["--dry-run"] if dry_run else []), *args])
     assert result.exit_code == 0, result.output
     return result.output
 
@@ -100,3 +107,39 @@ def test_date_option_means_the_whole_week(monkeypatch):
 def test_no_games_message_kept_for_the_web_progress_parser(monkeypatch):
     out = run(monkeypatch, datetime(2026, 10, 17, 14, 27, tzinfo=ZURICH), "--date", "2026-09-01")
     assert "Keine Resultate im Zeitraum gefunden." in out
+
+
+HOME_PLAYED = [
+    tg(10, date(2026, 10, 17), "09:00", "Junioren C Regional", (6, 3), "UHC Alpha", HOME_VENUE),  # win
+    tg(11, date(2026, 10, 17), "10:50", "Junioren C Regional", (2, 7), "UHC Beta", HOME_VENUE),  # loss
+    tg(12, date(2026, 10, 17), "12:00", "Herren Aktive GF 4. Liga", (1, 1), "UHC Zeta", "Auswaerts-Halle"),
+]
+HOME_PLANNED = [tg(13, date(2026, 10, 17), "13:00", "Damen Aktive KF 3. Liga", None, "UHC Gamma", HOME_VENUE)]
+
+
+def test_home_games_also_get_a_feed_post_in_their_own_folder(monkeypatch, tmp_path):
+    out = run(
+        monkeypatch, datetime(2026, 10, 17, 14, 27, tzinfo=ZURICH),
+        "--output-dir", str(tmp_path), played=HOME_PLAYED, planned=HOME_PLANNED, dry_run=False,
+    )
+    assert "3 Heimspiel(e) gefunden - erzeuge zusaetzlich den Feed-Post." in out
+    lines = [l for l in out.splitlines() if l.startswith("2026-W42:")]
+    assert lines == ["2026-W42: 4 Spiele -> 1 Bild(er)", "2026-W42: 3 Spiele -> 1 Bild(er)"]  # story, then feed
+    assert out.count("Titel:") == 1  # the feed post has a fixed title, no date title
+    assert (tmp_path / "results" / "2026-W42" / "post_1of1.png").is_file()
+    assert (tmp_path / "home_results" / "2026-W42" / "post_1of1.png").is_file()
+    assert "FEHLENDES RESULTAT: Damen Aktive KF 3. Liga" in out  # home game today without score
+
+
+def test_no_home_games_means_no_feed_post_and_a_short_message(monkeypatch, tmp_path):
+    out = run(
+        monkeypatch, datetime(2026, 10, 17, 14, 27, tzinfo=ZURICH),
+        "--output-dir", str(tmp_path), played=HOME_PLAYED[2:], planned=[], dry_run=False,
+    )
+    assert "Keine Heimspiele in diesem Zeitraum - kein Feed-Post noetig." in out
+    assert (tmp_path / "results").is_dir() and not (tmp_path / "home_results").exists()
+
+
+def test_dry_run_marks_home_hall_games(monkeypatch):
+    out = run(monkeypatch, datetime(2026, 10, 17, 14, 27, tzinfo=ZURICH), played=HOME_PLAYED, planned=HOME_PLANNED)
+    assert out.count("| Heimhalle") == 3

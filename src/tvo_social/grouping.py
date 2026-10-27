@@ -181,6 +181,7 @@ def paginate_by_category(
     section_gap: float = layout.SECTION_GAP,
     max_categories: int | None = None,
     max_games: int | None = None,
+    balance: bool = False,
 ) -> list[dict[str, list[TeamGame]]]:
     """Split categorized games into pages (one dict per output image),
     keeping every category's games together on a single page. A category
@@ -197,7 +198,7 @@ def paginate_by_category(
     category with 3 games (Junioren E) counts for more than one with 2,
     which pixel height alone approximates but doesn't guarantee.
 
-    When either cap is set, pagination is balanced: first a plain greedy
+    When either cap is set (or balance=True), pagination is balanced: first a plain greedy
     pack determines the minimum number of pages needed, then categories are
     redistributed as evenly as possible across exactly that many pages
     (e.g. 7 categories over 2 pages -> 4+3, not 4+2+1 over 3 pages worth of
@@ -215,7 +216,7 @@ def paginate_by_category(
 
     pages = _pack_pages(items, capacity, max_categories, max_games)
 
-    if (max_categories is not None or max_games is not None) and len(pages) > 1:
+    if (max_categories is not None or max_games is not None or balance) and len(pages) > 1:
         page_targets = _even_split_targets(len(items), len(pages))
         balanced = _pack_pages(items, capacity, max_categories, max_games, page_targets)
         if balanced is not None:
