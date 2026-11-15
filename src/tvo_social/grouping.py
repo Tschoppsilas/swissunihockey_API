@@ -42,28 +42,56 @@ def upcoming_weekend(today: date) -> tuple[date, date]:
     return sunday - timedelta(days=1), sunday
 
 
-def pick_results_window(
-    candidate_dates: list[date],
-    now: datetime,
-    mode: Literal["current", "last"] = "current",
-    anchor: date | None = None,
-) -> tuple[tuple[date, date], str | None]:
-    """The (Monday, Sunday) week whose results to show, plus an optional note.
+# Selectable modes per kind of post. The first entry is the default.
+PERIOD_MODES: dict[str, tuple[str, ...]] = {
+    "results": ("current", "last"),
+    "announce": ("upcoming", "after-next"),
+}
 
-    anchor: the Mon-Sun week containing that date.
-    "last": the week before the current one.
-    "current": the current week, but if no game has been played in it yet,
-    the latest earlier week that has played games.
-    candidate_dates are the dates of games that have a result."""
-    this_week = week_bounds(now.date())
+
+def resolve_period(
+    kind: Literal["results", "announce"],
+    mode: str,
+    now: datetime,
+    anchor: date | None = None,
+    played_dates: list[date] | tuple[date, ...] = (),
+) -> tuple[tuple[date, date], str | None]:
+    """The single place that turns "what the user selected" into the
+    (first day, last day) period to generate, plus an optional note - shared by
+    `results` and `weekend` so both always agree.
+
+    anchor (a picked date, any weekday): the whole Mon-Sun week containing it.
+
+    kind="results":
+      "current": this Mon-Sun week; if no game has a result in it yet (played_dates
+      = dates of games with a result), the latest earlier week that has one.
+      "last": the week before this one.
+
+    kind="announce" (Saturday + Sunday of a weekend):
+      "upcoming": this week's weekend - but on a Sunday that weekend is already
+      ending, so it is next week's.
+      "after-next": the weekend after "upcoming".
+
+    `now` must already be in Swiss time (see cli._now); the server runs in UTC."""
+    if mode not in PERIOD_MODES[kind]:
+        raise ValueError(f"Unbekannter Modus {mode!r} fuer {kind!r}")
+    today = now.date()
     if anchor is not None:
         return week_bounds(anchor), None
+
+    if kind == "announce":
+        saturday, sunday = upcoming_weekend(today)
+        shift = timedelta(days=7 if today.weekday() == 6 else 0)
+        if mode == "after-next":
+            shift += timedelta(days=7)
+        return (saturday + shift, sunday + shift), None
+
+    this_week = week_bounds(today)
     if mode == "last":
         return week_bounds(this_week[0] - timedelta(days=7)), None
-
-    if any(this_week[0] <= d <= this_week[1] for d in candidate_dates):
+    if any(this_week[0] <= d <= this_week[1] for d in played_dates):
         return this_week, None
-    earlier = [d for d in candidate_dates if d < this_week[0]]
+    earlier = [d for d in played_dates if d < this_week[0]]
     if not earlier:
         return this_week, None
     note = "Diese Woche wurde noch nichts gespielt - zeige die letzte Woche mit gespielten Spielen."

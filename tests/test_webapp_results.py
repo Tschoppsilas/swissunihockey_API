@@ -5,25 +5,38 @@ from tvo_social import webapp
 
 
 @pytest.mark.parametrize(
-    "mode,day,expected",
+    "kind,mode,day,expected",
     [
-        ("current", "", ["--weekend", "current"]),
-        ("last", "", ["--weekend", "last"]),
-        ("date", "2026-10-11", ["--date", "2026-10-11"]),
+        ("results", "current", "", ["--weekend", "current"]),
+        ("results", "last", "", ["--weekend", "last"]),
+        ("results", "", "", ["--weekend", "current"]),  # no mode given: the default
+        ("results", "date", "2026-10-11", ["--date", "2026-10-11"]),
+        ("weekend", "upcoming", "", ["--weekend", "upcoming"]),
+        ("weekend", "after-next", "", ["--weekend", "after-next"]),
+        ("weekend", "", "", ["--weekend", "upcoming"]),
+        ("weekend", "date", "2026-11-15", ["--date", "2026-11-15"]),  # a Sunday
+        ("weekend", "date", "2026-11-14", ["--date", "2026-11-14"]),  # a Saturday
     ],
 )
-def test_results_args_valid(mode, day, expected):
-    assert webapp._results_args(mode, day) == expected
+def test_selection_args_valid(kind, mode, day, expected):
+    assert webapp._selection_args(kind, mode, day) == expected
 
 
+@pytest.mark.parametrize("kind", ["results", "weekend"])
 @pytest.mark.parametrize(
     "mode,day",
-    [("date", ""), ("date", "11.10.2026"), ("date", "2026-13-40"), ("date", "x; rm -rf /"), ("bogus", ""), ("", "")],
+    [("date", ""), ("date", "11.10.2026"), ("date", "2026-13-40"), ("date", "x; rm -rf /"), ("bogus", "")],
 )
-def test_results_args_invalid_never_reach_the_subprocess(mode, day):
+def test_selection_args_invalid_never_reach_the_subprocess(kind, mode, day):
     with pytest.raises(HTTPException) as exc:
-        webapp._results_args(mode, day)
+        webapp._selection_args(kind, mode, day)
     assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize("kind,wrong_mode", [("results", "upcoming"), ("weekend", "current"), ("weekend", "last")])
+def test_each_kind_only_accepts_its_own_modes(kind, wrong_mode):
+    with pytest.raises(HTTPException):
+        webapp._selection_args(kind, wrong_mode, "")
 
 
 def test_start_job_passes_selection_to_the_job(monkeypatch):
@@ -41,14 +54,62 @@ def test_start_job_passes_selection_to_the_job(monkeypatch):
     webapp.start_job("results", mode="date", day="2026-10-11", _=None)
     assert started["args"] == ("results", ["--date", "2026-10-11"])
     webapp.JOB["running"] = False
-    webapp.start_job("weekend", mode="date", day="garbage", _=None)  # ignored for weekend
-    assert started["args"] == ("weekend", [])
+    webapp.start_job("weekend", mode="date", day="2026-11-15", _=None)
+    assert started["args"] == ("weekend", ["--date", "2026-11-15"])
+    webapp.JOB["running"] = False
+    webapp.start_job("weekend", _=None)
+    assert started["args"] == ("weekend", ["--weekend", "upcoming"])
+    webapp.JOB["running"] = False
+    with pytest.raises(HTTPException):
+        webapp.start_job("weekend", mode="date", day="garbage", _=None)
+    assert not webapp.JOB["running"]
 
 
-def test_page_has_the_weekend_selector():
+def test_page_has_both_selectors_with_their_own_options():
     html = webapp.render_page().body.decode()
-    assert "Aktuelle Woche (Standard)" in html and "Letzte Woche" in html
-    assert 'type="date"' in html
+    for text in (
+        "Kommendes Wochenende (Standard)", "Übernächstes Wochenende",
+        "Aktuelle Woche (Standard)", "Letzte Woche",
+    ):
+        assert text in html
+    assert html.count('type="date"') == 2
+    assert 'id="weekend-mode"' in html and 'id="weekend-day"' in html
+    assert 'id="results-mode"' in html and 'id="results-day"' in html
+    assert 'value="after-next"' in html and 'value="upcoming"' in html
+
+
+def test_summary_shows_the_period_the_server_used_for_weekend_and_results():
+    weekend_log = (
+        "Zeitraum: 16.11.2026 - 22.11.2026\n"
+        "2026-W47: 9 Spiele -> 1 Bild(er)\n  Titel: GAME WEEKEND - 21.-22.11.\n"
+        "  geschrieben: output/story/2026-W47/post_1of1.png\n"
+        "\n3 Heimspiel(e) gefunden - erzeuge zusaetzlich den Feed-Post.\n"
+        "2026-W47: 3 Spiele -> 1 Bild(er)\n  Titel: GAME WEEKEND - 21.-22.11.\n"
+        "  geschrieben: output/announcements/2026-W47/post_1of1.png\n"
+    )
+    summary = webapp._build_summary("weekend", weekend_log, True)
+    assert "Erzeugt: 1 Story-Bild + 1 Feed-Post-Bild." in summary
+    assert "Zeitraum: 16.11.2026 - 22.11.2026" in summary
+    assert summary.count("GAME WEEKEND - 21.-22.11.") == 1
+
+    results_log = (
+        "Zeitraum: 09.11.2026 - 15.11.2026\n"
+        "2026-W46: 19 Spiele -> 3 Bild(er)\n  Titel: RESULTATE - 14.-15.11.\n"
+        "  geschrieben: output/results/2026-W46/post_1of3.png\n"
+    )
+    assert "Zeitraum: 09.11.2026 - 15.11.2026" in webapp._build_summary("results", results_log, True)
+
+
+def test_summary_when_the_period_has_no_games():
+    assert webapp._build_summary("weekend", "Zeitraum: 23.11.2026 - 29.11.2026\nKeine Spiele im Zeitraum gefunden.\n", True) == (
+        "Keine Spiele im Zeitraum gefunden. Zeitraum: 23.11.2026 - 29.11.2026."
+    )
+
+
+def test_progress_messages_do_not_claim_it_is_the_coming_weekend():
+    ctx = {}
+    assert webapp._parse_progress("weekend", "Keine Spiele im Zeitraum gefunden.", ctx)[0] == 100
+    assert webapp._parse_progress("weekend", "Kein Heimspiel im Zeitraum - kein Feed-Post noetig.", ctx)[0] == 98
 
 
 def test_summary_names_the_games_period_and_the_fallback_note():

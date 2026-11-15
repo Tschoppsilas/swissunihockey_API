@@ -19,6 +19,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from PIL import Image
 from pydantic import BaseModel
 
+from .grouping import PERIOD_MODES
 from .instagram import (
     CAPTION_MAX_CHARS,
     CAROUSEL_MAX_ITEMS,
@@ -143,10 +144,10 @@ def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
 
     if "Heimspiel(e) gefunden" in line:
         return 90, "Heimspiel gefunden - erstelle Feed-Post..."
-    if "Kein Heimspiel am kommenden Wochenende" in line:
+    if "Kein Heimspiel im Zeitraum" in line:
         return 98, "Kein Heimspiel - fertig."
-    if "Keine Spiele am kommenden Wochenende gefunden" in line:
-        return 100, "Keine Spiele am kommenden Wochenende gefunden."
+    if "Keine Spiele im Zeitraum gefunden" in line:
+        return 100, "Keine Spiele im Zeitraum gefunden."
     if "Keine Resultate im Zeitraum gefunden" in line:
         return 100, "Keine Resultate im Zeitraum gefunden."
     if "Keine Heimspiele in diesem Zeitraum" in line:
@@ -164,17 +165,20 @@ def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
     return None
 
 
-def _results_args(mode: str, day: str) -> list[str]:
-    """CLI arguments for the results weekend selector; validated here so only
-    known values ever reach the subprocess."""
+def _selection_args(kind: str, mode: str, day: str) -> list[str]:
+    """CLI arguments for the period selector of "weekend" / "results"
+    (a mode from grouping.PERIOD_MODES, or "date" + a day); validated here so
+    only known values ever reach the subprocess."""
     if mode == "date":
         try:
             datetime.strptime(day, "%Y-%m-%d")
         except ValueError:
             raise HTTPException(400, "Bitte ein gültiges Datum wählen.")
         return ["--date", day]
-    if mode not in ("current", "last"):
-        raise HTTPException(400, "Unbekannte Auswahl für das Wochenende.")
+    modes = PERIOD_MODES["announce" if kind == "weekend" else "results"]
+    mode = mode or modes[0]
+    if mode not in modes:
+        raise HTTPException(400, "Unbekannte Auswahl für den Zeitraum.")
     return ["--weekend", mode]
 
 
@@ -240,22 +244,30 @@ def _build_summary(kind: str, log_text: str, ok: bool) -> str:
     def plural(n: int, noun: str) -> str:
         return f"{n} {noun}" if n == 1 else f"{n} {noun}er"
 
+    # The period the server actually used, so a wrong pick is visible at once.
+    period = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("Zeitraum:")), "")
+    period_text = f" Zeitraum: {escape(period)}." if period else ""
+    titles = list(dict.fromkeys(
+        l.split("Titel:", 1)[1].strip() for l in lines if l.strip().startswith("Titel:")
+    ))
+
     if kind == "weekend":
         if story_count == 0 and feed_count == 0:
-            return "Keine Spiele am kommenden Wochenende gefunden."
+            return f"Keine Spiele im Zeitraum gefunden.{period_text}"
         parts = [plural(story_count, "Story-Bild")]
         if feed_count:
             parts.append(plural(feed_count, "Feed-Post-Bild"))
-        summary = "Erzeugt: " + " + ".join(parts) + "."
+        summary = "Erzeugt: " + " + ".join(parts) + "." + period_text
+        if titles:
+            summary += f" ({escape(titles[0])})"
     else:
-        titles = [l.split("Titel:", 1)[1].strip() for l in lines if l.strip().startswith("Titel:")]
         notes = [l.split(":", 1)[1].strip() for l in lines if l.startswith("Hinweis:")]
         if results_count == 0:
-            return "Keine Resultate im Zeitraum gefunden."
+            return f"Keine Resultate im Zeitraum gefunden.{period_text}"
         parts = [plural(results_count, "Story-Bild")]
         if home_results_count:
             parts.append(plural(home_results_count, "Feed-Post-Bild"))
-        summary = "Erzeugt: " + " + ".join(parts) + "."
+        summary = "Erzeugt: " + " + ".join(parts) + "." + period_text
         if titles:
             summary += f" ({escape(', '.join(titles))})"
         for note in notes:
@@ -448,6 +460,7 @@ PAGE_TEMPLATE = """<!doctype html>
             background: #c8102e; color: white; font-weight: 600; }}
   button:active {{ background: #a10d25; }}
   button:disabled {{ background: #d99; }}
+  .job-group {{ display: flex; flex-direction: column; gap: 8px; }}
   .results-option {{ font-size: 1rem; padding: 12px; border: 1px solid #ccc; border-radius: 10px;
                      background: #fff; color: #1a1a1a; width: 100%; box-sizing: border-box; }}
   .ok {{ color: #1a7d1a; font-weight: 600; }}
@@ -508,15 +521,26 @@ PAGE_TEMPLATE = """<!doctype html>
 <body>
 <h1>TV Oberwil Social</h1>
 <div class="buttons">
-  <button onclick="runJob('weekend')">Kommendes Wochenende</button>
-  <button onclick="runJob('results')">Resultate generieren</button>
-  <select id="results-mode" class="results-option" onchange="onResultsModeChange()"
-          aria-label="Wochenende für die Resultate">
-    <option value="current">Aktuelle Woche (Standard)</option>
-    <option value="last">Letzte Woche</option>
-    <option value="date">Datum wählen...</option>
-  </select>
-  <input type="date" id="results-day" class="results-option" hidden aria-label="Datum für die Resultate">
+  <div class="job-group">
+    <button onclick="runJob('weekend')">Kommendes Wochenende</button>
+    <select id="weekend-mode" class="results-option" onchange="onModeChange('weekend')"
+            aria-label="Zeitraum für die Ankündigungen">
+      <option value="upcoming">Kommendes Wochenende (Standard)</option>
+      <option value="after-next">Übernächstes Wochenende</option>
+      <option value="date">Datum wählen...</option>
+    </select>
+    <input type="date" id="weekend-day" class="results-option" hidden aria-label="Datum für die Ankündigungen">
+  </div>
+  <div class="job-group">
+    <button onclick="runJob('results')">Resultate generieren</button>
+    <select id="results-mode" class="results-option" onchange="onModeChange('results')"
+            aria-label="Zeitraum für die Resultate">
+      <option value="current">Aktuelle Woche (Standard)</option>
+      <option value="last">Letzte Woche</option>
+      <option value="date">Datum wählen...</option>
+    </select>
+    <input type="date" id="results-day" class="results-option" hidden aria-label="Datum für die Resultate">
+  </div>
 </div>
 <div class="buttons">
   <button id="ig-check-btn" onclick="checkInstagram()">Instagram-Verbindung testen</button>
@@ -793,24 +817,23 @@ async function checkInstagram() {{
   }}
 }}
 
-function onResultsModeChange() {{
-  document.getElementById('results-day').hidden =
-    document.getElementById('results-mode').value !== 'date';
+function onModeChange(kind) {{
+  document.getElementById(kind + '-day').hidden =
+    document.getElementById(kind + '-mode').value !== 'date';
 }}
 
 async function runJob(kind) {{
-  let url = '/run/' + kind;
-  if (kind === 'results') {{
-    const mode = document.getElementById('results-mode').value;
-    url += '?mode=' + mode;
-    if (mode === 'date') {{
-      const day = document.getElementById('results-day').value;
-      if (!day) {{
-        alert('Bitte zuerst ein Datum wählen.');
-        return;
-      }}
-      url += '&day=' + encodeURIComponent(day);
+  // Same selector for both buttons ("weekend" and "results"): a mode, or a
+  // picked date - the server turns a date into its whole Mon-Sun week.
+  const mode = document.getElementById(kind + '-mode').value;
+  let url = '/run/' + kind + '?mode=' + encodeURIComponent(mode);
+  if (mode === 'date') {{
+    const day = document.getElementById(kind + '-day').value;
+    if (!day) {{
+      alert('Bitte zuerst ein Datum wählen.');
+      return;
     }}
+    url += '&day=' + encodeURIComponent(day);
   }}
 
   const buttons = document.querySelectorAll('.buttons button, .buttons select, .buttons input');
@@ -864,11 +887,11 @@ def partial_galleries(_: None = Depends(require_auth)) -> HTMLResponse:
 
 @app.post("/run/{kind}")
 def start_job(
-    kind: str, mode: str = "current", day: str = "", _: None = Depends(require_auth)
+    kind: str, mode: str = "", day: str = "", _: None = Depends(require_auth)
 ) -> dict:
     if kind not in JOB_COMMANDS:
         raise HTTPException(404, "Unbekannte Aktion.")
-    extra_args = _results_args(mode, day) if kind == "results" else []
+    extra_args = _selection_args(kind, mode, day)
     with JOB_LOCK:
         if JOB["running"]:
             raise HTTPException(409, "Es läuft bereits eine Generierung.")

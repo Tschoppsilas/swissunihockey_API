@@ -12,6 +12,10 @@
 # those.
 #
 # Usage: ./generate_results.sh   (run from anywhere - it cd's to its own folder)
+#   Optional: any other week instead of the current one, e.g.
+#   ./generate_results.sh --weekend last          (the week before)
+#   ./generate_results.sh --date 2026-11-15       (the Mon-Sun week containing that date,
+#                                                  any weekday)
 
 set -uo pipefail
 
@@ -43,7 +47,7 @@ RESULTS_LOG=$(mktemp)
 trap 'rm -f "$RESULTS_LOG"' EXIT
 
 echo "--- tvo-social results (aktuelle Woche) ---"
-if ! "$TVO_SOCIAL" results | tee "$RESULTS_LOG"; then
+if ! "$TVO_SOCIAL" results "$@" | tee "$RESULTS_LOG"; then
     echo >&2
     echo "FEHLER: 'tvo-social results' ist fehlgeschlagen. Abbruch." >&2
     exit 1

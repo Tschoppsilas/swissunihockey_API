@@ -261,10 +261,10 @@ def test_paginate_by_category_max_games_allows_full_max_categories_when_games_ar
     assert list(pages[0].keys()) == ["A", "B", "C", "D"]
 
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from tvo_social.grouping import pick_results_window
+from tvo_social.grouping import resolve_period
 
 ZURICH = ZoneInfo("Europe/Zurich")
 
@@ -275,48 +275,166 @@ def at(day: date, hour: int = 12, minute: int = 0) -> datetime:
 
 MON_12, SUN_18 = date(2026, 10, 12), date(2026, 10, 18)
 MON_5, SUN_11 = date(2026, 10, 5), date(2026, 10, 11)
+SAT_17 = date(2026, 10, 17)
+SAT_24, SUN_25 = date(2026, 10, 24), date(2026, 10, 25)
+SAT_31, SUN_1 = date(2026, 10, 31), date(2026, 11, 1)
 
 
-def test_window_current_week_with_played_games_is_mon_to_sun():
-    now = at(date(2026, 10, 17), 14, 27)  # Saturday
-    window, note = pick_results_window([date(2026, 10, 17), date(2026, 10, 11)], now)
-    assert window == (MON_12, SUN_18)
-    assert note is None
+def results(mode="current", now=None, anchor=None, played=()):
+    return resolve_period("results", mode, now or at(SAT_17), anchor, played)
 
 
-def test_window_includes_a_midweek_game_once_played():
-    now = at(date(2026, 10, 15))  # Thursday, a Tuesday game has a result
-    window, note = pick_results_window([date(2026, 10, 13), date(2026, 10, 11)], now)
+def announce(mode="upcoming", now=None, anchor=None):
+    return resolve_period("announce", mode, now or at(SAT_17), anchor)
+
+
+# --- a picked date: the Mon-Sun week it lies in, for EVERY weekday and kind ---
+
+WEEK_DAYS = [
+    (MON_12 + timedelta(days=i), name)
+    for i, name in enumerate(
+        ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+    )
+]
+
+
+@pytest.mark.parametrize("day,name", WEEK_DAYS)
+@pytest.mark.parametrize("kind", ["results", "announce"])
+def test_picked_date_gives_its_whole_week_for_every_weekday(kind, day, name):
+    mode = "current" if kind == "results" else "upcoming"
+    for now in (at(date(2026, 1, 1)), at(SAT_17, 14, 27), at(date(2026, 11, 15), 23, 59)):
+        assert resolve_period(kind, mode, now, anchor=day) == ((MON_12, SUN_18), None), name
+
+
+@pytest.mark.parametrize("kind", ["results", "announce"])
+def test_picked_date_works_for_every_day_of_two_years_including_year_boundaries(kind):
+    mode = "current" if kind == "results" else "upcoming"
+    d = date(2025, 1, 1)
+    while d <= date(2027, 1, 7):
+        (first, last), note = resolve_period(kind, mode, at(date(2026, 6, 1)), anchor=d)
+        assert first.weekday() == 0 and last.weekday() == 6 and (last - first).days == 6, d
+        assert first <= d <= last and note is None, d
+        d += timedelta(days=1)
+
+
+def test_picked_date_year_boundary_examples():
+    assert results(anchor=date(2026, 12, 31))[0] == (date(2026, 12, 28), date(2027, 1, 3))
+    assert results(anchor=date(2027, 1, 1))[0] == (date(2026, 12, 28), date(2027, 1, 3))
+    assert announce(anchor=date(2027, 1, 3))[0] == (date(2026, 12, 28), date(2027, 1, 3))
+    assert announce(anchor=date(2024, 12, 30))[0] == (date(2024, 12, 30), date(2025, 1, 5))
+
+
+def test_picked_date_ignores_the_mode_and_the_current_time():
+    for mode in ("current", "last"):
+        assert results(mode, at(date(2030, 5, 5)), anchor=date(2026, 11, 15))[0] == (
+            date(2026, 11, 9),
+            date(2026, 11, 15),
+        )
+    for mode in ("upcoming", "after-next"):
+        assert announce(mode, at(date(2030, 5, 5)), anchor=date(2026, 11, 15))[0] == (
+            date(2026, 11, 9),
+            date(2026, 11, 15),
+        )
+
+
+# --- results: current / last / fallback ---
+
+
+def test_results_current_week_with_played_games_is_mon_to_sun():
+    window, note = results(now=at(SAT_17, 14, 27), played=[SAT_17, date(2026, 10, 11)])
     assert window == (MON_12, SUN_18) and note is None
 
 
-def test_window_falls_back_to_latest_week_with_played_games():
-    now = at(date(2026, 10, 14))  # Wednesday, nothing played this week yet
-    window, note = pick_results_window([date(2026, 10, 3), date(2026, 10, 11), date(2026, 10, 10)], now)
+def test_results_include_a_midweek_game_once_played():
+    window, note = results(now=at(date(2026, 10, 15)), played=[date(2026, 10, 13), date(2026, 10, 11)])
+    assert window == (MON_12, SUN_18) and note is None
+
+
+def test_results_fall_back_to_latest_week_with_played_games():
+    window, note = results(
+        now=at(date(2026, 10, 14)), played=[date(2026, 10, 3), date(2026, 10, 11), date(2026, 10, 10)]
+    )
     assert window == (MON_5, SUN_11)
     assert note
 
 
-def test_window_fallback_can_land_on_a_midweek_game():
-    now = at(date(2026, 10, 19))  # Monday, last played game was on a Wednesday
-    window, _ = pick_results_window([date(2026, 10, 14), date(2026, 10, 4)], now)
+def test_results_fallback_can_land_on_a_midweek_game():
+    window, _ = results(now=at(date(2026, 10, 19)), played=[date(2026, 10, 14), date(2026, 10, 4)])
     assert window == (MON_12, SUN_18)
 
 
-def test_window_without_any_games_is_the_current_week():
-    window, note = pick_results_window([], at(date(2026, 10, 14)))
+def test_results_without_any_games_is_the_current_week():
+    window, note = results(now=at(date(2026, 10, 14)))
     assert window == (MON_12, SUN_18) and note is None
 
 
-def test_window_last_is_the_previous_week():
-    assert pick_results_window([], at(date(2026, 10, 17)), "last")[0] == (MON_5, SUN_11)
-    assert pick_results_window([], at(date(2026, 10, 19)), "last")[0] == (MON_12, SUN_18)
+def test_results_last_is_the_previous_week():
+    assert results("last", at(SAT_17))[0] == (MON_5, SUN_11)
+    assert results("last", at(date(2026, 10, 19)))[0] == (MON_12, SUN_18)
 
 
-def test_window_anchor_is_the_whole_week_of_that_date():
-    now = at(date(2026, 10, 17))
-    assert pick_results_window([], now, anchor=date(2026, 10, 11))[0] == (MON_5, SUN_11)
-    assert pick_results_window([], now, anchor=date(2026, 10, 14))[0] == (MON_12, SUN_18)
+# --- announcements: coming / after-next weekend, incl. the Sunday edge case ---
+
+
+@pytest.mark.parametrize(
+    "day,expected",
+    [
+        (date(2026, 10, 12), (SAT_17, SUN_18)),  # Monday
+        (date(2026, 10, 13), (SAT_17, SUN_18)),  # Tuesday
+        (date(2026, 10, 14), (SAT_17, SUN_18)),  # Wednesday
+        (date(2026, 10, 15), (SAT_17, SUN_18)),  # Thursday
+        (date(2026, 10, 16), (SAT_17, SUN_18)),  # Friday
+        (SAT_17, (SAT_17, SUN_18)),  # Saturday: the weekend is in progress, still coming
+        (SUN_18, (SAT_24, SUN_25)),  # Sunday: this weekend is ending, so next weekend
+    ],
+)
+def test_announce_upcoming_weekend_for_every_weekday(day, expected):
+    assert announce("upcoming", at(day))[0] == expected
+    shifted = (expected[0] + timedelta(days=7), expected[1] + timedelta(days=7))
+    assert announce("after-next", at(day))[0] == shifted
+
+
+def test_announce_boundaries_monday_midnight_and_sunday_last_minute():
+    assert announce("upcoming", at(date(2026, 10, 12), 0, 0))[0] == (SAT_17, SUN_18)
+    assert announce("upcoming", at(date(2026, 10, 11), 23, 59))[0] == (SAT_17, SUN_18)  # Sunday before
+    assert announce("upcoming", at(SUN_18, 23, 59))[0] == (SAT_24, SUN_25)
+    assert announce("upcoming", at(date(2026, 10, 19), 0, 0))[0] == (SAT_24, SUN_25)  # next Monday 00:00
+    assert announce("after-next", at(SUN_18, 23, 59))[0] == (SAT_31, SUN_1)
+
+
+def test_announce_across_the_year_boundary():
+    assert announce("upcoming", at(date(2026, 12, 27)))[0] == (date(2027, 1, 2), date(2027, 1, 3))  # Sunday
+    assert announce("upcoming", at(date(2026, 12, 28)))[0] == (date(2027, 1, 2), date(2027, 1, 3))  # Monday
+    assert announce("after-next", at(date(2026, 12, 27)))[0] == (date(2027, 1, 9), date(2027, 1, 10))
+    assert announce("upcoming", at(date(2026, 12, 31)))[0] == (date(2027, 1, 2), date(2027, 1, 3))
+
+
+# --- results boundaries: Monday 00:00 / Sunday 23:59 ---
+
+
+def test_results_boundaries_monday_midnight_and_sunday_last_minute():
+    assert results(now=at(SUN_18, 23, 59), played=[SAT_17])[0] == (MON_12, SUN_18)
+    window, note = results(now=at(date(2026, 10, 19), 0, 0), played=[SAT_17])  # next Monday 00:00
+    assert window == (MON_12, SUN_18) and note  # new week empty, falls back to the one just ended
+    assert results("last", at(SUN_18, 23, 59))[0] == (MON_5, SUN_11)
+    assert results("last", at(date(2026, 10, 19), 0, 0))[0] == (MON_12, SUN_18)
+
+
+def test_results_across_the_year_boundary():
+    assert results(now=at(date(2027, 1, 1)), played=[date(2026, 12, 30)])[0] == (
+        date(2026, 12, 28),
+        date(2027, 1, 3),
+    )
+    window, note = results(now=at(date(2027, 1, 4)), played=[date(2027, 1, 2)])
+    assert window == (date(2026, 12, 28), date(2027, 1, 3)) and note
+    assert results("last", at(date(2027, 1, 5)))[0] == (date(2026, 12, 28), date(2027, 1, 3))
+
+
+def test_unknown_mode_is_rejected():
+    with pytest.raises(ValueError):
+        resolve_period("results", "upcoming", at(SAT_17))
+    with pytest.raises(ValueError):
+        resolve_period("announce", "current", at(SAT_17))
 
 
 def test_paginate_balance_flag_evens_out_pages_even_without_caps():

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -32,10 +32,10 @@ from .grouping import (
     format_weekend_title,
     group_by_category,
     group_games_by_week,
+    PERIOD_MODES,
     half_season_end,
     paginate_by_category,
-    pick_results_window,
-    upcoming_weekend,
+    resolve_period,
 )
 from .models import Game, Team, TeamGame
 from .render import render_batches
@@ -44,6 +44,23 @@ from .templates.instagram_v1 import InstagramV1Template
 from .templates.story import StoryTemplate
 
 GAMES_FETCH_LIMIT = 200
+
+
+def _now() -> datetime:
+    """Current time in Swiss time. The server (Render) runs in UTC, so a bare
+    date.today() is a day behind around midnight and would pick the wrong week."""
+    return datetime.now(SWISS_TZ)
+
+
+# Shared by `results` and `weekend`: a picked date always means the whole
+# Mon-Sun week containing it (see grouping.resolve_period).
+date_option = click.option(
+    "--date",
+    "anchor",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Use the Mon-Sun week containing this date (YYYY-MM-DD), any weekday.",
+)
 
 
 def _fetch_team_games(
@@ -190,7 +207,7 @@ def announce(output_dir: Path | None, dry_run: bool) -> None:
     client = ApiClient(cfg.api_base)
     teams = get_teams(client, cfg)
 
-    today = date.today()
+    today = _now().date()
     end_date = half_season_end(today)
     click.echo(f"Zeitraum: {today:%d.%m.%Y} - {end_date:%d.%m.%Y}")
 
@@ -226,7 +243,7 @@ def story(output_dir: Path | None, dry_run: bool) -> None:
     client = ApiClient(cfg.api_base)
     teams = get_teams(client, cfg)
 
-    today = date.today()
+    today = _now().date()
     end_date = half_season_end(today)
     click.echo(f"Zeitraum: {today:%d.%m.%Y} - {end_date:%d.%m.%Y}")
 
@@ -271,18 +288,12 @@ def story(output_dir: Path | None, dry_run: bool) -> None:
 @click.option(
     "--weekend",
     "weekend_mode",
-    type=click.Choice(["current", "last"]),
-    default="current",
+    type=click.Choice(list(PERIOD_MODES["results"])),
+    default=PERIOD_MODES["results"][0],
     help="current: games played this Mon-Sun week (falls back to the latest week "
     "with played games if none yet); last: the week before.",
 )
-@click.option(
-    "--date",
-    "anchor",
-    type=click.DateTime(formats=["%Y-%m-%d"]),
-    default=None,
-    help="Show the Mon-Sun week containing this date (YYYY-MM-DD).",
-)
+@date_option
 @click.option("--output-dir", type=click.Path(path_type=Path), default=None)
 @click.option("--dry-run", is_flag=True, default=False)
 def results(
@@ -307,7 +318,7 @@ def results(
     cfg = load_config()
     client = ApiClient(cfg.api_base)
     teams = get_teams(client, cfg)
-    now = datetime.now(SWISS_TZ)
+    now = _now()
 
     played_all = _fetch_team_games(client, teams, status="played", order="DESC", season=season)
     played_all = [tg for tg in played_all if tg.date <= now.date()]
@@ -325,11 +336,12 @@ def results(
         start_date, end_date = week_start.date(), week_end.date()
     else:
         # Only games with a result decide which week counts as "played".
-        (start_date, end_date), note = pick_results_window(
-            [tg.date for tg in played_all],
-            now,
+        (start_date, end_date), note = resolve_period(
+            "results",
             weekend_mode,
+            now,
             anchor.date() if anchor else None,
+            [tg.date for tg in played_all],
         )
 
     click.echo(f"Zeitraum: {start_date:%d.%m.%Y} - {end_date:%d.%m.%Y}")
@@ -394,25 +406,36 @@ def results(
 
 
 @main.command()
+@click.option(
+    "--weekend",
+    "weekend_mode",
+    type=click.Choice(list(PERIOD_MODES["announce"])),
+    default=PERIOD_MODES["announce"][0],
+    help="upcoming: the coming weekend (on a Sunday: next week's); after-next: the one after.",
+)
+@date_option
 @click.option("--output-dir", type=click.Path(path_type=Path), default=None)
 @click.option("--dry-run", is_flag=True, default=False, help="Only print what would be generated.")
-def weekend(output_dir: Path | None, dry_run: bool) -> None:
-    """Generate the story post for just the upcoming weekend (all
-    categories), plus the home-tournament feed post too if a home game is
-    among them - the fast path for the common weekly case, vs. `announce`/
-    `story` which (re)generate every week through the half-season cutoff."""
+def weekend(weekend_mode: str, anchor: datetime | None, output_dir: Path | None, dry_run: bool) -> None:
+    """Generate the story post for the chosen period (default: the coming
+    weekend; all categories), plus the home-tournament feed post too if a
+    home game is among them - the fast path for the common weekly case, vs.
+    `announce`/`story` which (re)generate every week through the half-season
+    cutoff."""
     cfg = load_config()
     client = ApiClient(cfg.api_base)
     teams = get_teams(client, cfg)
 
-    start_date, end_date = upcoming_weekend(date.today())
-    click.echo(f"Kommendes Wochenende: {start_date:%d.%m.%Y} - {end_date:%d.%m.%Y}")
+    (start_date, end_date), _ = resolve_period(
+        "announce", weekend_mode, _now(), anchor.date() if anchor else None
+    )
+    click.echo(f"Zeitraum: {start_date:%d.%m.%Y} - {end_date:%d.%m.%Y}")
 
     team_games = _fetch_team_games(client, teams, status="planned", order="ASC")
     team_games = [tg for tg in team_games if start_date <= tg.date <= end_date]
 
     if not team_games:
-        click.echo("Keine Spiele am kommenden Wochenende gefunden.")
+        click.echo("Keine Spiele im Zeitraum gefunden.")
         return
 
     grouped_weeks = group_games_by_week(team_games)
@@ -437,7 +460,7 @@ def weekend(output_dir: Path | None, dry_run: bool) -> None:
 
     home_games = [tg for tg in team_games if tg.game.venue == cfg.home_venue]
     if not home_games:
-        click.echo("\nKein Heimspiel am kommenden Wochenende - kein Feed-Post noetig.")
+        click.echo("\nKein Heimspiel im Zeitraum - kein Feed-Post noetig.")
         return
 
     click.echo(f"\n{len(home_games)} Heimspiel(e) gefunden - erzeuge zusaetzlich den Feed-Post.")
