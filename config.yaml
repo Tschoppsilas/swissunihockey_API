@@ -12,3 +12,10 @@ missing_venue_text: "ORT FOLGT"
 # Shown as a warning stamp on a results card whose game should already have
 # been played (date passed) but has no recorded score yet.
 missing_result_text: "RESULTAT FOLGT"
+
+# Table posts (`tvo-social tables`). Categories listed here are skipped - match is
+# on the START of the API category text ("Junioren E" covers "Junioren E Regional"),
+# case-insensitive. Remove a line to switch that category on again.
+tables:
+  exclude_categories:
+    - "Junioren E"

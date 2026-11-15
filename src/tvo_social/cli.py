@@ -39,9 +39,11 @@ from .grouping import (
 )
 from .models import Game, Team, TeamGame
 from .render import render_batches
+from .tables import SkippedTable, ascii_text, build_rows, collect_tables, slugify
 from .teams import get_teams, refresh_team_cache
 from .templates.instagram_v1 import InstagramV1Template
 from .templates.story import StoryTemplate
+from .templates.table_card import TableTemplate
 
 GAMES_FETCH_LIMIT = 200
 
@@ -522,6 +524,73 @@ def weekend(
         dry_run,
         template_kwargs={"missing_venue_text": cfg.missing_venue_text},
     )
+
+
+@main.command()
+@click.option(
+    "--season", type=int, default=None,
+    help="Season (e.g. 2025 for the last one). Default: the current season.",
+)
+@click.option(
+    "--label", default="",
+    help='Addition to the "Stand" line, e.g. "Winterpause" or "Schlusstabelle".',
+)
+@click.option(
+    "--stand", type=click.DateTime(formats=["%Y-%m-%d"]), default=None,
+    help="Date shown as 'Stand' (YYYY-MM-DD). Default: today.",
+)
+@click.option("--output-dir", type=click.Path(path_type=Path), default=None)
+@click.option("--dry-run", is_flag=True, default=False, help="Only print what would be generated.")
+def tables(season: int | None, label: str, stand: datetime | None, output_dir: Path | None, dry_run: bool) -> None:
+    """Generate one table image per league group (all TVO teams of a group
+    share one image) into output/tables/<season>/. Categories listed in
+    config.yaml under tables.exclude_categories are skipped."""
+    cfg = load_config()
+    client = ApiClient(cfg.api_base)
+    teams = get_teams(client, cfg)
+    labels = load_team_labels()
+
+    stand_date = stand.date() if stand else _now().date()
+    stand_text = f"Stand: {stand_date:%d.%m.%Y}" + (f" · {label.strip()}" if label.strip() else "")
+
+    def say(text: str) -> None:
+        click.echo(ascii_text(text))
+
+    groups, skipped = collect_tables(client, teams, labels, cfg.tables_exclude_categories, season, say)
+
+    template = TableTemplate()
+    written = 0
+    used: set[Path] = set()
+    for group in groups:
+        table = group.table
+        rows = build_rows(table, labels, cfg.club_id)
+        say(f"Tabelle: {table.league_text} - {len(rows)} Teams, TVO: {', '.join(r.name for r in rows if r.is_tvo) or '-'}")
+
+        folder = (output_dir or cfg.output_dir) / "tables" / str(table.season)
+        base = slugify(table.league_text)
+        path, counter = folder / f"{base}.png", 2
+        while path in used:  # two groups with the same league text must not overwrite each other
+            path, counter = folder / f"{base}-{counter}.png", counter + 1
+        used.add(path)
+
+        if dry_run:
+            say(f"  (Trockenlauf) wuerde schreiben: {path}")
+            continue
+        try:
+            scale = template.render_to(path, rows, table.has_overtime_columns, table.league_text, stand_text)
+        except ValueError as exc:  # a name that cannot fit even at the smallest size: report, never cut it off
+            skipped.append(SkippedTable(table.league_text, table.league_text, f"passt nicht auf das Bild ({exc})"))
+            continue
+        say(f"  geschrieben: {path} (Skalierung {scale:.2f})")
+        written += 1
+
+    count = len(groups) if dry_run else written
+    say("")
+    say(f"Zusammenfassung: {count} Bild(er), {len(skipped)} Tabelle(n) uebersprungen")
+    for item in skipped:
+        say(f"UEBERSPRUNGEN: {item.label} ({item.category}): {item.reason}")
+    if not groups:
+        say("Keine Tabellen erzeugt.")
 
 
 @main.command(name="refresh-teams")

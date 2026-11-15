@@ -59,6 +59,17 @@ class ApiClient:
             return []
         return self._as_list(data.get("teams", {}).get("team", []))
 
+    def get_team_table(self, team_id: int, season: int | None = None) -> tuple[dict, list[dict]] | None:
+        """The table of the group this team plays in, for the given season
+        (default: the current one) - always via the team endpoint, because
+        league codes and group numbers change from season to season. Returns
+        (table header, entries), or None on 404 (no table for that season)."""
+        data = self._get(f"/teams/{team_id}/table", params={"season": season} if season is not None else None)
+        if data is None:
+            return None
+        table = data.get("table", {})
+        return table, self._as_list(table.get("entry"))
+
     def get_team_games(
         self,
         team_id: int,

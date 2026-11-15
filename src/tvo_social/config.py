@@ -19,6 +19,9 @@ class Config:
     home_venue: str = "Thomasgarten (Oberwil BL)"
     missing_venue_text: str = "ORT FOLGT"
     missing_result_text: str = "RESULTAT FOLGT"
+    # Categories (start of the API category text, case-insensitive) that get no
+    # table post, e.g. "Junioren E" (tournament play without a ranking).
+    tables_exclude_categories: tuple[str, ...] = ()
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -39,6 +42,9 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         home_venue=raw.get("home_venue", Config.home_venue),
         missing_venue_text=raw.get("missing_venue_text", Config.missing_venue_text),
         missing_result_text=raw.get("missing_result_text", Config.missing_result_text),
+        tables_exclude_categories=tuple(
+            str(c) for c in ((raw.get("tables") or {}).get("exclude_categories") or [])
+        ),
     )
 
 

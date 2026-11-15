@@ -123,3 +123,70 @@ class TeamGame:
         if self.our_goals < self.opp_goals:
             return "loss"
         return "draw"
+
+
+@dataclass(frozen=True)
+class TableEntry:
+    """One row of a league-group table, exactly as the API delivers it (the
+    `place` is taken over unchanged - it is never recomputed)."""
+
+    place: int
+    team_id: int
+    club_id: int
+    name: str
+    games: int
+    wins: int
+    wins_overtime: int
+    ties: int
+    defeats_overtime: int
+    defeats: int
+    goals_for: int
+    goals_against: int
+    points: int
+
+    @property
+    def goal_difference(self) -> int:
+        return self.goals_for - self.goals_against
+
+    @classmethod
+    def from_api(cls, raw: dict) -> "TableEntry":
+        return cls(
+            place=raw["place"],
+            team_id=raw["teamid"],
+            club_id=raw.get("clubid", 0),
+            name=raw["teamname"],
+            games=raw["games"],
+            wins=raw["wins"],
+            wins_overtime=raw.get("wins-overtime", 0),
+            ties=raw["ties"],
+            defeats_overtime=raw.get("defeats-overtime", 0),
+            defeats=raw["defeats"],
+            goals_for=raw["goals-scored"],
+            goals_against=raw["goals-received"],
+            points=raw["points"],
+        )
+
+
+@dataclass(frozen=True)
+class LeagueTable:
+    season: int
+    league_text: str
+    entries: tuple[TableEntry, ...]
+
+    @property
+    def has_overtime_columns(self) -> bool:
+        """The overtime columns (SnV/NnV) are only worth their width if at
+        least one team in this very table has a non-zero value there."""
+        return any(e.wins_overtime or e.defeats_overtime for e in self.entries)
+
+    @property
+    def team_ids(self) -> frozenset[int]:
+        return frozenset(e.team_id for e in self.entries)
+
+    @classmethod
+    def from_api(cls, raw_table: dict, entries: list[dict]) -> "LeagueTable":
+        return cls(
+            season=raw_table.get("season", 0),
+            league_text=raw_table.get("leaguetext", ""),
+            entries=tuple(sorted((TableEntry.from_api(e) for e in entries), key=lambda e: e.place)),
+        )
