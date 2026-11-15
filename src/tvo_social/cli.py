@@ -27,7 +27,9 @@ from .api_client import ApiClient
 from .config import load_config, load_team_labels
 from .grouping import (
     PERIOD_MODES,
+    PERIOD_SCOPES,
     SWISS_TZ,
+    describe_period,
     format_weekend_title,
     group_by_category,
     group_games_by_week,
@@ -50,15 +52,45 @@ def _now() -> datetime:
     return datetime.now(SWISS_TZ)
 
 
-# Shared by `results` and `weekend`: a picked date always means the whole
-# Mon-Sun week containing it (see grouping.resolve_period).
+# Shared by `results` and `weekend`: a picked date plus how much of its week to
+# use (see grouping.resolve_period).
 date_option = click.option(
     "--date",
     "anchor",
     type=click.DateTime(formats=["%Y-%m-%d"]),
     default=None,
-    help="Use the Mon-Sun week containing this date (YYYY-MM-DD), any weekday.",
+    help="Use this date (YYYY-MM-DD, any weekday); --scope says how much of its week.",
 )
+scope_option = click.option(
+    "--scope",
+    type=click.Choice(list(PERIOD_SCOPES)),
+    default=None,
+    help="With --date: day = only that day (default), weekend = Sat+Sun of its week, "
+    "week = its whole Mon-Sun week.",
+)
+
+
+def _check_scope(anchor: datetime | None, scope: str | None) -> str | None:
+    """The effective scope: only meaningful together with --date (default "day")."""
+    if anchor is None:
+        if scope is not None:
+            raise click.UsageError("--scope gilt nur zusammen mit --date.")
+        return None
+    return scope or PERIOD_SCOPES[0]
+
+
+def _no_games_message(prefix: str, first, last, scope: str) -> str:
+    """'Keine Spiele am So 15.11.2026.' - one full stop, even when the period text
+    (e.g. 'Sa 14.11. - So 15.11.') already ends in one."""
+    text = f"{prefix} {describe_period(first, last, scope)}"
+    return text if text.endswith(".") else text + "."
+
+
+def _format_period(first, last) -> str:
+    """'15.11.2026' for a single day, otherwise '09.11.2026 - 15.11.2026'."""
+    if first == last:
+        return f"{first:%d.%m.%Y}"
+    return f"{first:%d.%m.%Y} - {last:%d.%m.%Y}"
 
 
 def _fetch_team_games(
@@ -292,6 +324,7 @@ def story(output_dir: Path | None, dry_run: bool) -> None:
     "with played games if none yet); last: the week before.",
 )
 @date_option
+@scope_option
 @click.option("--output-dir", type=click.Path(path_type=Path), default=None)
 @click.option("--dry-run", is_flag=True, default=False)
 def results(
@@ -300,18 +333,21 @@ def results(
     season: int | None,
     weekend_mode: str,
     anchor: datetime | None,
+    scope: str | None,
     output_dir: Path | None,
     dry_run: bool,
 ) -> None:
     """Generate the results story post: every game played in the chosen
-    Mon-Sun week (plus games dated today or earlier that still have no
-    score), all categories - and, if there were home games, a feed post
-    with just their results. Default: the current week, falling back to the
-    latest week with played games."""
+    period (plus games dated today or earlier that still have no score), all
+    categories - and, if there were home games, a feed post with just their
+    results. Default: the current Mon-Sun week, falling back to the latest
+    week with played games; with --date only that day (or its weekend / week,
+    see --scope) and never a fallback."""
     if (week_start is None) != (week_end is None):
         raise click.UsageError("--week-start und --week-end müssen zusammen angegeben werden.")
     if week_start is not None and anchor is not None:
         raise click.UsageError("--date kann nicht mit --week-start/--week-end kombiniert werden.")
+    scope = _check_scope(anchor, scope)
 
     cfg = load_config()
     client = ApiClient(cfg.api_base)
@@ -340,9 +376,10 @@ def results(
             now,
             anchor.date() if anchor else None,
             [tg.date for tg in played_all],
+            scope or PERIOD_SCOPES[0],
         )
 
-    click.echo(f"Zeitraum: {start_date:%d.%m.%Y} - {end_date:%d.%m.%Y}")
+    click.echo(f"Zeitraum: {_format_period(start_date, end_date)}")
     if note:
         click.echo(f"Hinweis: {note}")
 
@@ -351,7 +388,10 @@ def results(
     team_games = played + missing
 
     if not team_games:
-        click.echo("Keine Resultate im Zeitraum gefunden.")
+        if scope:
+            click.echo(_no_games_message("Keine Spiele mit Resultat", start_date, end_date, scope))
+        else:
+            click.echo("Keine Resultate im Zeitraum gefunden.")
         return
 
     if dry_run:
@@ -412,28 +452,39 @@ def results(
     help="upcoming: the coming weekend (on a Sunday: next week's); after-next: the one after.",
 )
 @date_option
+@scope_option
 @click.option("--output-dir", type=click.Path(path_type=Path), default=None)
 @click.option("--dry-run", is_flag=True, default=False, help="Only print what would be generated.")
-def weekend(weekend_mode: str, anchor: datetime | None, output_dir: Path | None, dry_run: bool) -> None:
+def weekend(
+    weekend_mode: str,
+    anchor: datetime | None,
+    scope: str | None,
+    output_dir: Path | None,
+    dry_run: bool,
+) -> None:
     """Generate the story post for the chosen period (default: the coming
     weekend; all categories), plus the home-tournament feed post too if a
     home game is among them - the fast path for the common weekly case, vs.
     `announce`/`story` which (re)generate every week through the half-season
-    cutoff."""
+    cutoff. With --date only that day (or its weekend / week, see --scope)."""
+    scope = _check_scope(anchor, scope)
     cfg = load_config()
     client = ApiClient(cfg.api_base)
     teams = get_teams(client, cfg)
 
     (start_date, end_date), _ = resolve_period(
-        "announce", weekend_mode, _now(), anchor.date() if anchor else None
+        "announce", weekend_mode, _now(), anchor.date() if anchor else None, scope=scope or PERIOD_SCOPES[0]
     )
-    click.echo(f"Zeitraum: {start_date:%d.%m.%Y} - {end_date:%d.%m.%Y}")
+    click.echo(f"Zeitraum: {_format_period(start_date, end_date)}")
 
     team_games = _fetch_team_games(client, teams, status="planned", order="ASC")
     team_games = [tg for tg in team_games if start_date <= tg.date <= end_date]
 
     if not team_games:
-        click.echo("Keine Spiele im Zeitraum gefunden.")
+        if scope:
+            click.echo(_no_games_message("Keine Spiele", start_date, end_date, scope))
+        else:
+            click.echo("Keine Spiele im Zeitraum gefunden.")
         return
 
     grouped_weeks = group_games_by_week(team_games)

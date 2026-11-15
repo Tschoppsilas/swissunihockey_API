@@ -53,18 +53,52 @@ PERIOD_MODES: dict[str, tuple[str, ...]] = {
 }
 
 
+# What a picked date stands for: just that day, the Sat+Sun of its week, or its
+# whole Mon-Sun week. The first entry is the default.
+PERIOD_SCOPES: tuple[str, ...] = ("day", "weekend", "week")
+
+WEEKDAYS_DE = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
+
+
+def format_day(d: date) -> str:
+    """'So 15.11.2026'"""
+    return f"{WEEKDAYS_DE[d.weekday()]} {d:%d.%m.%Y}"
+
+
+def format_range(first: date, last: date, reference: date | None = None) -> str:
+    """'Sa 14.11. - So 15.11.' - with years when the range spans two, or when it
+    lies in another year than `reference` (the picked date it is shown next to)."""
+    spans_years = first.year != last.year or (reference is not None and reference.year != first.year)
+    pattern = "%d.%m.%Y" if spans_years else "%d.%m."
+    return f"{WEEKDAYS_DE[first.weekday()]} {first.strftime(pattern)} - {WEEKDAYS_DE[last.weekday()]} {last.strftime(pattern)}"
+
+
+def describe_period(first: date, last: date, scope: str) -> str:
+    """For 'Keine Spiele <this>.': 'am So 15.11.2026', 'am Wochenende Sa 14.11. -
+    So 15.11.', 'in der Woche Mo 09.11. - So 15.11.'"""
+    if scope == "day":
+        return f"am {format_day(first)}"
+    if scope == "weekend":
+        return f"am Wochenende {format_range(first, last)}"
+    return f"in der Woche {format_range(first, last)}"
+
+
 def resolve_period(
     kind: Literal["results", "announce"],
     mode: str,
     now: datetime,
     anchor: date | None = None,
     played_dates: list[date] | tuple[date, ...] = (),
+    scope: str = "day",
 ) -> tuple[tuple[date, date], str | None]:
     """The single place that turns "what the user selected" into the
     (first day, last day) period to generate, plus an optional note - shared by
     `results` and `weekend` so both always agree.
 
-    anchor (a picked date, any weekday): the whole Mon-Sun week containing it.
+    anchor (a picked date, any weekday) + scope - never a fallback to another week:
+      "day": exactly that day.
+      "weekend": the Saturday + Sunday of the Mon-Sun week containing it.
+      "week": the whole Mon-Sun week containing it.
 
     kind="results":
       "current": this Mon-Sun week; if no game has a result in it yet (played_dates
@@ -79,8 +113,14 @@ def resolve_period(
     `now` must already be in Swiss time (see cli._now); the server runs in UTC."""
     if mode not in PERIOD_MODES[kind]:
         raise ValueError(f"Unbekannter Modus {mode!r} fuer {kind!r}")
+    if scope not in PERIOD_SCOPES:
+        raise ValueError(f"Unbekannter Umfang {scope!r}")
     today = now.date()
     if anchor is not None:
+        if scope == "day":
+            return (anchor, anchor), None
+        if scope == "weekend":
+            return upcoming_weekend(anchor), None
         return week_bounds(anchor), None
 
     if kind == "announce":

@@ -5,21 +5,38 @@ from tvo_social import webapp
 
 
 @pytest.mark.parametrize(
-    "kind,mode,day,expected",
+    "kind,mode,day,scope,expected",
     [
-        ("results", "current", "", ["--weekend", "current"]),
-        ("results", "last", "", ["--weekend", "last"]),
-        ("results", "", "", ["--weekend", "current"]),  # no mode given: the default
-        ("results", "date", "2026-10-11", ["--date", "2026-10-11"]),
-        ("weekend", "upcoming", "", ["--weekend", "upcoming"]),
-        ("weekend", "after-next", "", ["--weekend", "after-next"]),
-        ("weekend", "", "", ["--weekend", "upcoming"]),
-        ("weekend", "date", "2026-11-15", ["--date", "2026-11-15"]),  # a Sunday
-        ("weekend", "date", "2026-11-14", ["--date", "2026-11-14"]),  # a Saturday
+        ("results", "current", "", "", ["--weekend", "current"]),
+        ("results", "last", "", "", ["--weekend", "last"]),
+        ("results", "", "", "", ["--weekend", "current"]),  # no mode given: the default
+        ("results", "date", "2026-10-11", "", ["--date", "2026-10-11", "--scope", "day"]),  # default: only that day
+        ("results", "date", "2026-10-11", "weekend", ["--date", "2026-10-11", "--scope", "weekend"]),
+        ("results", "date", "2026-10-11", "week", ["--date", "2026-10-11", "--scope", "week"]),
+        ("weekend", "upcoming", "", "", ["--weekend", "upcoming"]),
+        ("weekend", "after-next", "", "", ["--weekend", "after-next"]),
+        ("weekend", "", "", "", ["--weekend", "upcoming"]),
+        ("weekend", "date", "2026-11-15", "day", ["--date", "2026-11-15", "--scope", "day"]),  # a Sunday
+        ("weekend", "date", "2026-11-14", "week", ["--date", "2026-11-14", "--scope", "week"]),  # a Saturday
     ],
 )
-def test_selection_args_valid(kind, mode, day, expected):
-    assert webapp._selection_args(kind, mode, day) == expected
+def test_selection_args_valid(kind, mode, day, scope, expected):
+    assert webapp._selection_args(kind, mode, day, scope) == expected
+
+
+@pytest.mark.parametrize("kind", ["results", "weekend"])
+@pytest.mark.parametrize("scope", ["month", "Day", "day; ls", "weekend,week"])
+def test_unknown_scope_never_reaches_the_subprocess(kind, scope):
+    with pytest.raises(HTTPException) as exc:
+        webapp._selection_args(kind, "date", "2026-11-15", scope)
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize("kind,mode", [("results", "current"), ("weekend", "upcoming"), ("weekend", "")])
+def test_a_scope_without_a_date_selection_is_refused_not_ignored(kind, mode):
+    with pytest.raises(HTTPException) as exc:
+        webapp._selection_args(kind, mode, "", "week")
+    assert exc.value.status_code == 400
 
 
 @pytest.mark.parametrize("kind", ["results", "weekend"])
@@ -52,10 +69,10 @@ def test_start_job_passes_selection_to_the_job(monkeypatch):
     monkeypatch.setattr(webapp.threading, "Thread", FakeThread)
     webapp.JOB["running"] = False
     webapp.start_job("results", mode="date", day="2026-10-11", _=None)
-    assert started["args"] == ("results", ["--date", "2026-10-11"])
+    assert started["args"] == ("results", ["--date", "2026-10-11", "--scope", "day"])
     webapp.JOB["running"] = False
-    webapp.start_job("weekend", mode="date", day="2026-11-15", _=None)
-    assert started["args"] == ("weekend", ["--date", "2026-11-15"])
+    webapp.start_job("weekend", mode="date", day="2026-11-15", scope="weekend", _=None)
+    assert started["args"] == ("weekend", ["--date", "2026-11-15", "--scope", "weekend"])
     webapp.JOB["running"] = False
     webapp.start_job("weekend", _=None)
     assert started["args"] == ("weekend", ["--weekend", "upcoming"])
@@ -73,6 +90,13 @@ def test_page_has_both_selectors_with_their_own_options():
     ):
         assert text in html
     assert html.count('type="date"') == 2
+    for kind in ("weekend", "results"):
+        assert f'id="{kind}-scope"' in html and f'id="{kind}-daterow"' in html
+    for text in ("Nur dieser Tag", "Dieses Wochenende (Sa + So)", "Ganze Woche (Mo-So)"):
+        assert html.count(text) == 2, text  # once per selector
+    assert html.count('<option value="day">') == 2 and html.count('<option value="weekend">') == 2
+    assert html.count('<option value="week">') == 2
+    assert ".date-row[hidden]" in html  # a flex row would otherwise stay visible despite [hidden]
     assert 'id="weekend-mode"' in html and 'id="weekend-day"' in html
     assert 'id="results-mode"' in html and 'id="results-day"' in html
     assert 'value="after-next"' in html and 'value="upcoming"' in html
@@ -104,6 +128,23 @@ def test_summary_when_the_period_has_no_games():
     assert webapp._build_summary("weekend", "Zeitraum: 23.11.2026 - 29.11.2026\nKeine Spiele im Zeitraum gefunden.\n", True) == (
         "Keine Spiele im Zeitraum gefunden. Zeitraum: 23.11.2026 - 29.11.2026."
     )
+
+
+def test_summary_names_the_chosen_day_scope_when_there_are_no_games():
+    day_log = "Zeitraum: 15.11.2026\nKeine Spiele am So 15.11.2026.\n"
+    assert webapp._build_summary("weekend", day_log, True) == "Keine Spiele am So 15.11.2026."
+    results_log = "Zeitraum: 15.11.2026\nKeine Spiele mit Resultat am So 15.11.2026.\n"
+    assert webapp._build_summary("results", results_log, True) == "Keine Spiele mit Resultat am So 15.11.2026."
+    weekend_log = "Zeitraum: 28.11.2026 - 29.11.2026\nKeine Spiele am Wochenende Sa 28.11. - So 29.11.\n"
+    assert webapp._build_summary("weekend", weekend_log, True) == "Keine Spiele am Wochenende Sa 28.11. - So 29.11."
+
+
+def test_progress_reports_the_no_games_line_as_it_is():
+    ctx = {}
+    percent, text = webapp._parse_progress("results", "Keine Spiele mit Resultat am So 15.11.2026.", ctx)
+    assert percent == 100 and text == "Keine Spiele mit Resultat am So 15.11.2026."
+    percent, text = webapp._parse_progress("weekend", "Keine Spiele in der Woche Mo 09.11. - So 15.11.", ctx)
+    assert percent == 100 and "in der Woche" in text
 
 
 def test_progress_messages_do_not_claim_it_is_the_coming_weekend():
@@ -197,41 +238,51 @@ def test_start_job_refuses_a_date_with_the_default_selection(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["results", "weekend"])
 @pytest.mark.parametrize(
-    "day,picked",
+    "day,picked,weekend_of_week",
     [
-        ("2026-11-09", "Mo 09.11.2026"),
-        ("2026-11-10", "Di 10.11.2026"),
-        ("2026-11-11", "Mi 11.11.2026"),
-        ("2026-11-12", "Do 12.11.2026"),
-        ("2026-11-13", "Fr 13.11.2026"),
-        ("2026-11-14", "Sa 14.11.2026"),
-        ("2026-11-15", "So 15.11.2026"),
+        ("2026-11-09", "Mo 09.11.2026", "Sa 14.11. - So 15.11."),
+        ("2026-11-10", "Di 10.11.2026", "Sa 14.11. - So 15.11."),
+        ("2026-11-11", "Mi 11.11.2026", "Sa 14.11. - So 15.11."),
+        ("2026-11-12", "Do 12.11.2026", "Sa 14.11. - So 15.11."),
+        ("2026-11-13", "Fr 13.11.2026", "Sa 14.11. - So 15.11."),
+        ("2026-11-14", "Sa 14.11.2026", "Sa 14.11. - So 15.11."),
+        ("2026-11-15", "So 15.11.2026", "Sa 14.11. - So 15.11."),
     ],
 )
-def test_period_preview_for_every_weekday(kind, day, picked):
-    expected = f"Gewählt: {picked} -> Zeitraum Mo 09.11. - So 15.11.2026"
-    assert webapp.period_preview(kind, day, None) == {"text": expected}
+def test_period_preview_for_every_weekday_and_scope(kind, day, picked, weekend_of_week):
+    assert webapp.period_preview(kind, day, "day", None) == {"text": f"Gewählt: {picked} -> nur dieser Tag"}
+    assert webapp.period_preview(kind, day, "weekend", None)["text"] == f"Gewählt: {picked} -> {weekend_of_week}"
+    assert webapp.period_preview(kind, day, "week", None)["text"] == f"Gewählt: {picked} -> Mo 09.11. - So 15.11."
 
 
-def test_period_preview_year_boundary_and_next_week():
-    assert webapp.period_preview("results", "2027-01-01", None)["text"] == (
-        "Gewählt: Fr 01.01.2027 -> Zeitraum Mo 28.12. - So 03.01.2027"
+def test_period_preview_defaults_to_the_day_and_handles_the_year_boundary():
+    assert webapp.period_preview("results", "2026-11-15", "day", None)["text"] == (
+        "Gewählt: So 15.11.2026 -> nur dieser Tag"
     )
-    assert webapp.period_preview("weekend", "2026-11-22", None)["text"] == (
-        "Gewählt: So 22.11.2026 -> Zeitraum Mo 16.11. - So 22.11.2026"
+    assert webapp.period_preview("results", "2027-01-01", "week", None)["text"] == (
+        "Gewählt: Fr 01.01.2027 -> Mo 28.12.2026 - So 03.01.2027"
     )
+    assert webapp.period_preview("weekend", "2026-12-31", "weekend", None)["text"] == (
+        "Gewählt: Do 31.12.2026 -> Sa 02.01.2027 - So 03.01.2027"
+    )
+
+
+def test_period_preview_rejects_an_unknown_scope():
+    with pytest.raises(HTTPException) as exc:
+        webapp.period_preview("results", "2026-11-15", "month", None)
+    assert exc.value.status_code == 400
 
 
 @pytest.mark.parametrize("day", ["", "15.11.2026", "2026-13-40", "morgen", "2026-11-15; ls"])
 def test_period_preview_rejects_unreadable_dates(day):
     with pytest.raises(HTTPException) as exc:
-        webapp.period_preview("results", day, None)
+        webapp.period_preview("results", day, "day", None)
     assert exc.value.status_code == 400
 
 
 def test_period_preview_rejects_unknown_kind():
     with pytest.raises(HTTPException) as exc:
-        webapp.period_preview("posten", "2026-11-15", None)
+        webapp.period_preview("posten", "2026-11-15", "day", None)
     assert exc.value.status_code == 404
 
 
@@ -243,6 +294,6 @@ def test_page_wires_up_the_preview_and_the_consistency_checks():
     for snippet in (
         "function readDay(kind)", "function syncMode(kind)", "async function updatePreview(kind)",
         "addEventListener('pageshow'", "Bitte ein Datum wählen.", "Das Datum ist nicht lesbar",
-        "'/period?kind='",
+        "'/period?kind='", "'&scope='", "-daterow",
     ):
         assert snippet in html, snippet

@@ -14,8 +14,9 @@
 # Usage: ./generate_results.sh   (run from anywhere - it cd's to its own folder)
 #   Optional: any other week instead of the current one, e.g.
 #   ./generate_results.sh --weekend last          (the week before)
-#   ./generate_results.sh --date 2026-11-15       (the Mon-Sun week containing that date,
-#                                                  any weekday)
+#   ./generate_results.sh --date 2026-11-15       (only the games of that day)
+#   ./generate_results.sh --date 2026-11-15 --scope weekend   (Sat+Sun of that date's week)
+#   ./generate_results.sh --date 2026-11-15 --scope week      (its whole Mon-Sun week)
 
 set -uo pipefail
 

@@ -19,7 +19,14 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from PIL import Image
 from pydantic import BaseModel
 
-from .grouping import PERIOD_MODES, SWISS_TZ, resolve_period
+from .grouping import (
+    PERIOD_MODES,
+    PERIOD_SCOPES,
+    SWISS_TZ,
+    format_day,
+    format_range,
+    resolve_period,
+)
 from .instagram import (
     CAPTION_MAX_CHARS,
     CAROUSEL_MAX_ITEMS,
@@ -146,8 +153,10 @@ def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
         return 90, "Heimspiel gefunden - erstelle Feed-Post..."
     if "Kein Heimspiel im Zeitraum" in line:
         return 98, "Kein Heimspiel - fertig."
-    if "Keine Spiele im Zeitraum gefunden" in line:
-        return 100, "Keine Spiele im Zeitraum gefunden."
+    if line.startswith("Keine Spiele "):
+        # "Keine Spiele im Zeitraum gefunden." or, for a picked day / weekend /
+        # week, "Keine Spiele am So 15.11.2026." etc.
+        return 100, line.strip()
     if "Keine Resultate im Zeitraum gefunden" in line:
         return 100, "Keine Resultate im Zeitraum gefunden."
     if "Keine Heimspiele in diesem Zeitraum" in line:
@@ -165,19 +174,23 @@ def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
     return None
 
 
-def _selection_args(kind: str, mode: str, day: str) -> list[str]:
+def _selection_args(kind: str, mode: str, day: str, scope: str = "") -> list[str]:
     """CLI arguments for the period selector of "weekend" / "results"
-    (a mode from grouping.PERIOD_MODES, or "date" + a day); validated here so
-    only known values ever reach the subprocess."""
+    (a mode from grouping.PERIOD_MODES, or "date" + a day + a scope from
+    grouping.PERIOD_SCOPES); validated here so only known values ever reach the
+    subprocess."""
     if mode == "date":
         try:
             datetime.strptime(day, "%Y-%m-%d")
         except ValueError:
             raise HTTPException(400, "Bitte ein gültiges Datum wählen.")
-        return ["--date", day]
-    if day:
-        # A date came along but the selector is not on "Datum wählen..." - refuse
-        # instead of silently using the default period and dropping the date.
+        scope = scope or PERIOD_SCOPES[0]
+        if scope not in PERIOD_SCOPES:
+            raise HTTPException(400, "Unbekannter Umfang für das Datum.")
+        return ["--date", day, "--scope", scope]
+    if day or scope:
+        # A date (or scope) came along but the selector is not on "Datum
+        # wählen..." - refuse instead of silently using the default period.
         raise HTTPException(
             400, "Ein Datum wurde angegeben, aber 'Datum wählen...' ist nicht ausgewählt."
         )
@@ -188,26 +201,24 @@ def _selection_args(kind: str, mode: str, day: str) -> list[str]:
     return ["--weekend", mode]
 
 
-WEEKDAYS_DE = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
-
-
-def _describe_period(kind: str, day: str) -> str:
-    """What the server makes of a picked date, e.g. 'Gewählt: So 15.11.2026 ->
-    Zeitraum Mo 09.11. - So 15.11.2026' - computed by the same resolve_period
-    that the generation uses, so the preview can never disagree with it."""
+def _describe_period(kind: str, day: str, scope: str = "day") -> str:
+    """What the server makes of a picked date and scope, e.g. 'Gewählt: So
+    15.11.2026 -> nur dieser Tag' or '... -> Sa 14.11. - So 15.11.' - computed by
+    the same resolve_period that the generation uses, so the preview can never
+    disagree with it."""
     try:
         picked = datetime.strptime(day, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(400, "Das Datum ist nicht lesbar - bitte ein gültiges Datum wählen.")
+    if scope not in PERIOD_SCOPES:
+        raise HTTPException(400, "Unbekannter Umfang für das Datum.")
     period_kind = "announce" if kind == "weekend" else "results"
     (first, last), _ = resolve_period(
-        period_kind, PERIOD_MODES[period_kind][0], datetime.now(SWISS_TZ), picked
+        period_kind, PERIOD_MODES[period_kind][0], datetime.now(SWISS_TZ), picked, scope=scope
     )
-    return (
-        f"Gewählt: {WEEKDAYS_DE[picked.weekday()]} {picked:%d.%m.%Y} -> "
-        f"Zeitraum {WEEKDAYS_DE[first.weekday()]} {first:%d.%m.} - "
-        f"{WEEKDAYS_DE[last.weekday()]} {last:%d.%m.%Y}"
-    )
+    if scope == "day":
+        return f"Gewählt: {format_day(picked)} -> nur dieser Tag"
+    return f"Gewählt: {format_day(picked)} -> {format_range(first, last, picked)}"
 
 
 def _run_job(kind: str, extra_args: list[str] | None = None) -> None:
@@ -279,9 +290,18 @@ def _build_summary(kind: str, log_text: str, ok: bool) -> str:
         l.split("Titel:", 1)[1].strip() for l in lines if l.strip().startswith("Titel:")
     ))
 
+    none_line = next((l.strip() for l in lines if l.startswith("Keine Spiele ")), "")
+
+    def no_games(default: str) -> str:
+        if not none_line:
+            return f"{default}{period_text}"
+        # The picked day / weekend / week messages already name their period.
+        extra = period_text if none_line.endswith("im Zeitraum gefunden.") else ""
+        return escape(none_line) + extra
+
     if kind == "weekend":
         if story_count == 0 and feed_count == 0:
-            return f"Keine Spiele im Zeitraum gefunden.{period_text}"
+            return no_games("Keine Spiele im Zeitraum gefunden.")
         parts = [plural(story_count, "Story-Bild")]
         if feed_count:
             parts.append(plural(feed_count, "Feed-Post-Bild"))
@@ -291,7 +311,7 @@ def _build_summary(kind: str, log_text: str, ok: bool) -> str:
     else:
         notes = [l.split(":", 1)[1].strip() for l in lines if l.startswith("Hinweis:")]
         if results_count == 0:
-            return f"Keine Resultate im Zeitraum gefunden.{period_text}"
+            return no_games("Keine Resultate im Zeitraum gefunden.")
         parts = [plural(results_count, "Story-Bild")]
         if home_results_count:
             parts.append(plural(home_results_count, "Feed-Post-Bild"))
@@ -489,6 +509,9 @@ PAGE_TEMPLATE = """<!doctype html>
   button:active {{ background: #a10d25; }}
   button:disabled {{ background: #d99; }}
   .job-group {{ display: flex; flex-direction: column; gap: 8px; }}
+  .date-row {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+  .date-row[hidden] {{ display: none; }}
+  .date-row .results-option {{ flex: 1 1 11rem; width: auto; min-width: 0; }}
   .period-preview {{ font-size: 0.9rem; color: #444; }}
   .period-preview:empty {{ display: none; }}
   .period-preview.problem {{ color: #c8102e; font-weight: 600; }}
@@ -560,8 +583,16 @@ PAGE_TEMPLATE = """<!doctype html>
       <option value="after-next">Übernächstes Wochenende</option>
       <option value="date">Datum wählen...</option>
     </select>
-    <input type="date" id="weekend-day" class="results-option" hidden aria-label="Datum für die Ankündigungen"
-           oninput="onDayChange('weekend')" onchange="onDayChange('weekend')">
+    <div id="weekend-daterow" class="date-row" hidden>
+      <input type="date" id="weekend-day" class="results-option" aria-label="Datum für die Ankündigungen"
+             oninput="onDayChange('weekend')" onchange="onDayChange('weekend')">
+      <select id="weekend-scope" class="results-option" onchange="onDayChange('weekend')"
+              aria-label="Umfang für das gewählte Datum">
+        <option value="day">Nur dieser Tag</option>
+        <option value="weekend">Dieses Wochenende (Sa + So)</option>
+        <option value="week">Ganze Woche (Mo-So)</option>
+      </select>
+    </div>
     <div id="weekend-preview" class="period-preview" role="status"></div>
   </div>
   <div class="job-group">
@@ -572,8 +603,16 @@ PAGE_TEMPLATE = """<!doctype html>
       <option value="last">Letzte Woche</option>
       <option value="date">Datum wählen...</option>
     </select>
-    <input type="date" id="results-day" class="results-option" hidden aria-label="Datum für die Resultate"
-           oninput="onDayChange('results')" onchange="onDayChange('results')">
+    <div id="results-daterow" class="date-row" hidden>
+      <input type="date" id="results-day" class="results-option" aria-label="Datum für die Resultate"
+             oninput="onDayChange('results')" onchange="onDayChange('results')">
+      <select id="results-scope" class="results-option" onchange="onDayChange('results')"
+              aria-label="Umfang für das gewählte Datum">
+        <option value="day">Nur dieser Tag</option>
+        <option value="weekend">Dieses Wochenende (Sa + So)</option>
+        <option value="week">Ganze Woche (Mo-So)</option>
+      </select>
+    </div>
     <div id="results-preview" class="period-preview" role="status"></div>
   </div>
 </div>
@@ -880,7 +919,7 @@ function syncMode(kind) {{
     select.value = 'date';
     switched = true;
   }}
-  input.hidden = select.value !== 'date';
+  document.getElementById(kind + '-daterow').hidden = select.value !== 'date';
   return switched;
 }}
 
@@ -909,7 +948,9 @@ async function updatePreview(kind) {{
   }}
   const token = ++previewToken[kind];
   try {{
-    const response = await fetch('/period?kind=' + kind + '&day=' + encodeURIComponent(check.day));
+    const scope = document.getElementById(kind + '-scope').value;
+    const response = await fetch(
+      '/period?kind=' + kind + '&day=' + encodeURIComponent(check.day) + '&scope=' + encodeURIComponent(scope));
     const data = await response.json().catch(() => ({{}}));
     if (token !== previewToken[kind]) return;  // a newer pick is already on its way
     if (response.ok) {{
@@ -923,10 +964,11 @@ async function updatePreview(kind) {{
 }}
 
 function onModeChange(kind) {{
-  // Explicitly choosing Standard / last week / ... drops an old date, so the
-  // two can never contradict each other.
+  // Explicitly choosing Standard / last week / ... drops an old date (and its
+  // scope), so the two can never contradict each other.
   if (document.getElementById(kind + '-mode').value !== 'date') {{
     document.getElementById(kind + '-day').value = '';
+    document.getElementById(kind + '-scope').value = 'day';
   }}
   syncMode(kind);
   updatePreview(kind);
@@ -958,7 +1000,7 @@ async function runJob(kind) {{
   }}
 
   // Same selector for both buttons ("weekend" and "results"): a mode, or a
-  // picked date - the server turns a date into its whole Mon-Sun week.
+  // picked date plus its scope (only that day / Sat+Sun / whole week).
   const mode = document.getElementById(kind + '-mode').value;
   let url = '/run/' + kind + '?mode=' + encodeURIComponent(mode);
   if (mode === 'date') {{
@@ -968,7 +1010,8 @@ async function runJob(kind) {{
       document.getElementById(kind + '-day').focus();
       return;
     }}
-    url += '&day=' + encodeURIComponent(check.day);
+    url += '&day=' + encodeURIComponent(check.day)
+      + '&scope=' + encodeURIComponent(document.getElementById(kind + '-scope').value);
   }}
 
   const buttons = document.querySelectorAll('.buttons button, .buttons select, .buttons input');
@@ -1022,11 +1065,11 @@ def partial_galleries(_: None = Depends(require_auth)) -> HTMLResponse:
 
 @app.post("/run/{kind}")
 def start_job(
-    kind: str, mode: str = "", day: str = "", _: None = Depends(require_auth)
+    kind: str, mode: str = "", day: str = "", scope: str = "", _: None = Depends(require_auth)
 ) -> dict:
     if kind not in JOB_COMMANDS:
         raise HTTPException(404, "Unbekannte Aktion.")
-    extra_args = _selection_args(kind, mode, day)
+    extra_args = _selection_args(kind, mode, day, scope)
     with JOB_LOCK:
         if JOB["running"]:
             raise HTTPException(409, "Es läuft bereits eine Generierung.")
@@ -1035,10 +1078,12 @@ def start_job(
 
 
 @app.get("/period")
-def period_preview(kind: str, day: str, _: None = Depends(require_auth)) -> dict:
+def period_preview(
+    kind: str, day: str, scope: str = "day", _: None = Depends(require_auth)
+) -> dict:
     if kind not in JOB_COMMANDS:
         raise HTTPException(404, "Unbekannte Aktion.")
-    return {"text": _describe_period(kind, day)}
+    return {"text": _describe_period(kind, day, scope)}
 
 
 @app.get("/run/status")

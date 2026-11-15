@@ -98,14 +98,52 @@ def test_last_week_option(monkeypatch):
     assert "Titel: RESULTATE - 11.10." in out
 
 
-def test_date_option_means_the_whole_week(monkeypatch):
-    out = run(monkeypatch, datetime(2026, 10, 19, 9, 0, tzinfo=ZURICH), "--date", "2026-10-14")
+def test_date_with_scope_week_means_the_whole_week(monkeypatch):
+    out = run(monkeypatch, datetime(2026, 10, 19, 9, 0, tzinfo=ZURICH), "--date", "2026-10-14", "--scope", "week")
     assert "Zeitraum: 12.10.2026 - 18.10.2026" in out
     assert "Herren Cup" in out and "Junioren C Regional" in out
 
 
-def test_no_games_message_kept_for_the_web_progress_parser(monkeypatch):
-    out = run(monkeypatch, datetime(2026, 10, 17, 14, 27, tzinfo=ZURICH), "--date", "2026-09-01")
+def test_date_alone_means_only_that_day(monkeypatch):
+    out = run(monkeypatch, datetime(2026, 10, 19, 9, 0, tzinfo=ZURICH), "--date", "2026-10-14")
+    assert "Zeitraum: 14.10.2026" in out and "12.10.2026" not in out
+    assert "Herren Cup" in out  # the Wednesday game
+    assert "Junioren C Regional" not in out  # played on the Saturday
+    assert "Titel: RESULTATE - 14.10." in out
+
+
+def test_date_with_scope_weekend_means_saturday_and_sunday_of_that_week(monkeypatch):
+    out = run(monkeypatch, datetime(2026, 10, 19, 9, 0, tzinfo=ZURICH), "--date", "2026-10-14", "--scope", "weekend")
+    assert "Zeitraum: 17.10.2026 - 18.10.2026" in out
+    assert "Junioren C Regional" in out and "Herren Cup" not in out
+
+
+def test_a_day_without_games_says_so_and_does_not_fall_back(monkeypatch):
+    out = run(monkeypatch, datetime(2026, 10, 19, 9, 0, tzinfo=ZURICH), "--date", "2026-10-13")
+    assert "Keine Spiele mit Resultat am Di 13.10.2026." in out
+    assert "Hinweis" not in out and "Herren Cup" not in out and "Titel:" not in out
+
+
+def test_a_weekend_without_games_says_so(monkeypatch):
+    out = run(
+        monkeypatch, datetime(2026, 10, 19, 9, 0, tzinfo=ZURICH), "--date", "2026-10-28", "--scope", "weekend"
+    )
+    assert out.splitlines()[-1] == "Keine Spiele mit Resultat am Wochenende Sa 31.10. - So 01.11."
+    assert "Hinweis" not in out
+
+
+def test_a_picked_future_day_does_not_pretend_games_were_played(monkeypatch):
+    out = run(monkeypatch, datetime(2026, 10, 17, 14, 27, tzinfo=ZURICH), "--date", "2026-10-18")
+    assert "Keine Spiele mit Resultat am So 18.10.2026." in out
+
+
+def test_scope_without_date_is_a_usage_error():
+    result = CliRunner().invoke(cli.main, ["results", "--dry-run", "--scope", "week"])
+    assert result.exit_code == 2 and "--scope gilt nur zusammen mit --date" in result.output
+
+
+def test_no_games_message_without_a_date_is_kept_for_the_web_progress_parser(monkeypatch):
+    out = run(monkeypatch, datetime(2026, 10, 17, 14, 27, tzinfo=ZURICH), played=[], planned=[])
     assert "Keine Resultate im Zeitraum gefunden." in out
 
 
