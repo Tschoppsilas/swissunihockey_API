@@ -19,7 +19,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from PIL import Image
 from pydantic import BaseModel
 
-from .grouping import PERIOD_MODES
+from .grouping import PERIOD_MODES, SWISS_TZ, resolve_period
 from .instagram import (
     CAPTION_MAX_CHARS,
     CAROUSEL_MAX_ITEMS,
@@ -175,11 +175,39 @@ def _selection_args(kind: str, mode: str, day: str) -> list[str]:
         except ValueError:
             raise HTTPException(400, "Bitte ein gültiges Datum wählen.")
         return ["--date", day]
+    if day:
+        # A date came along but the selector is not on "Datum wählen..." - refuse
+        # instead of silently using the default period and dropping the date.
+        raise HTTPException(
+            400, "Ein Datum wurde angegeben, aber 'Datum wählen...' ist nicht ausgewählt."
+        )
     modes = PERIOD_MODES["announce" if kind == "weekend" else "results"]
     mode = mode or modes[0]
     if mode not in modes:
         raise HTTPException(400, "Unbekannte Auswahl für den Zeitraum.")
     return ["--weekend", mode]
+
+
+WEEKDAYS_DE = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
+
+
+def _describe_period(kind: str, day: str) -> str:
+    """What the server makes of a picked date, e.g. 'Gewählt: So 15.11.2026 ->
+    Zeitraum Mo 09.11. - So 15.11.2026' - computed by the same resolve_period
+    that the generation uses, so the preview can never disagree with it."""
+    try:
+        picked = datetime.strptime(day, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "Das Datum ist nicht lesbar - bitte ein gültiges Datum wählen.")
+    period_kind = "announce" if kind == "weekend" else "results"
+    (first, last), _ = resolve_period(
+        period_kind, PERIOD_MODES[period_kind][0], datetime.now(SWISS_TZ), picked
+    )
+    return (
+        f"Gewählt: {WEEKDAYS_DE[picked.weekday()]} {picked:%d.%m.%Y} -> "
+        f"Zeitraum {WEEKDAYS_DE[first.weekday()]} {first:%d.%m.} - "
+        f"{WEEKDAYS_DE[last.weekday()]} {last:%d.%m.%Y}"
+    )
 
 
 def _run_job(kind: str, extra_args: list[str] | None = None) -> None:
@@ -461,6 +489,9 @@ PAGE_TEMPLATE = """<!doctype html>
   button:active {{ background: #a10d25; }}
   button:disabled {{ background: #d99; }}
   .job-group {{ display: flex; flex-direction: column; gap: 8px; }}
+  .period-preview {{ font-size: 0.9rem; color: #444; }}
+  .period-preview:empty {{ display: none; }}
+  .period-preview.problem {{ color: #c8102e; font-weight: 600; }}
   .results-option {{ font-size: 1rem; padding: 12px; border: 1px solid #ccc; border-radius: 10px;
                      background: #fff; color: #1a1a1a; width: 100%; box-sizing: border-box; }}
   .ok {{ color: #1a7d1a; font-weight: 600; }}
@@ -529,7 +560,9 @@ PAGE_TEMPLATE = """<!doctype html>
       <option value="after-next">Übernächstes Wochenende</option>
       <option value="date">Datum wählen...</option>
     </select>
-    <input type="date" id="weekend-day" class="results-option" hidden aria-label="Datum für die Ankündigungen">
+    <input type="date" id="weekend-day" class="results-option" hidden aria-label="Datum für die Ankündigungen"
+           oninput="onDayChange('weekend')" onchange="onDayChange('weekend')">
+    <div id="weekend-preview" class="period-preview" role="status"></div>
   </div>
   <div class="job-group">
     <button onclick="runJob('results')">Resultate generieren</button>
@@ -539,7 +572,9 @@ PAGE_TEMPLATE = """<!doctype html>
       <option value="last">Letzte Woche</option>
       <option value="date">Datum wählen...</option>
     </select>
-    <input type="date" id="results-day" class="results-option" hidden aria-label="Datum für die Resultate">
+    <input type="date" id="results-day" class="results-option" hidden aria-label="Datum für die Resultate"
+           oninput="onDayChange('results')" onchange="onDayChange('results')">
+    <div id="results-preview" class="period-preview" role="status"></div>
   </div>
 </div>
 <div class="buttons">
@@ -817,23 +852,123 @@ async function checkInstagram() {{
   }}
 }}
 
-function onModeChange(kind) {{
-  document.getElementById(kind + '-day').hidden =
-    document.getElementById(kind + '-mode').value !== 'date';
+// Reads the date field of one selector ("weekend" / "results"). An empty or
+// unreadable value (partly typed, or a browser without a date picker) is a
+// problem to report - never something to silently replace by the default.
+function readDay(kind) {{
+  const input = document.getElementById(kind + '-day');
+  if (input.validity && input.validity.badInput) {{
+    return {{ ok: false, message: 'Das Datum ist nicht lesbar - bitte Tag, Monat und Jahr vollständig eingeben.' }};
+  }}
+  if (!input.value) {{
+    return {{ ok: false, empty: true, message: 'Bitte ein Datum wählen.' }};
+  }}
+  if (!/^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(input.value)) {{
+    return {{ ok: false, message: 'Das Datum ist nicht lesbar: "' + input.value + '" (erwartet: Tag.Monat.Jahr).' }};
+  }}
+  return {{ ok: true, day: input.value }};
 }}
 
+// A filled-in date wins over a selector that still says "Standard": switch the
+// selector to "Datum wählen..." (this also repairs what a browser restores on
+// reload / back), so a date is never silently ignored. Returns true if it switched.
+function syncMode(kind) {{
+  const select = document.getElementById(kind + '-mode');
+  const input = document.getElementById(kind + '-day');
+  let switched = false;
+  if (input.value && select.value !== 'date') {{
+    select.value = 'date';
+    switched = true;
+  }}
+  input.hidden = select.value !== 'date';
+  return switched;
+}}
+
+const previewToken = {{ weekend: 0, results: 0 }};
+
+function showPreview(kind, text, problem) {{
+  const box = document.getElementById(kind + '-preview');
+  box.textContent = text;
+  box.classList.toggle('problem', !!problem);
+}}
+
+// Shows what the server makes of the picked date (same function as the
+// generation uses), e.g. "Gewählt: So 15.11.2026 -> Zeitraum Mo 09.11. - So 15.11.2026".
+async function updatePreview(kind) {{
+  const select = document.getElementById(kind + '-mode');
+  if (select.value !== 'date') {{
+    previewToken[kind]++;
+    showPreview(kind, '', false);
+    return;
+  }}
+  const check = readDay(kind);
+  if (!check.ok) {{
+    previewToken[kind]++;
+    showPreview(kind, check.message, !check.empty);
+    return;
+  }}
+  const token = ++previewToken[kind];
+  try {{
+    const response = await fetch('/period?kind=' + kind + '&day=' + encodeURIComponent(check.day));
+    const data = await response.json().catch(() => ({{}}));
+    if (token !== previewToken[kind]) return;  // a newer pick is already on its way
+    if (response.ok) {{
+      showPreview(kind, data.text, false);
+    }} else {{
+      showPreview(kind, data.detail || 'Der Server konnte das Datum nicht lesen.', true);
+    }}
+  }} catch (err) {{
+    if (token === previewToken[kind]) showPreview(kind, 'Vorschau nicht möglich: ' + err, true);
+  }}
+}}
+
+function onModeChange(kind) {{
+  // Explicitly choosing Standard / last week / ... drops an old date, so the
+  // two can never contradict each other.
+  if (document.getElementById(kind + '-mode').value !== 'date') {{
+    document.getElementById(kind + '-day').value = '';
+  }}
+  syncMode(kind);
+  updatePreview(kind);
+}}
+
+function onDayChange(kind) {{
+  syncMode(kind);
+  updatePreview(kind);
+}}
+
+function syncAllSelectors() {{
+  ['weekend', 'results'].forEach(kind => {{
+    syncMode(kind);
+    updatePreview(kind);
+  }});
+}}
+window.addEventListener('pageshow', syncAllSelectors);
+window.addEventListener('load', syncAllSelectors);
+
 async function runJob(kind) {{
+  // Never start with a selection that contradicts the date field.
+  if (syncMode(kind)) {{
+    await updatePreview(kind);
+    const box = document.getElementById(kind + '-preview');
+    box.textContent = 'Ein Datum war eingetragen, die Auswahl steht jetzt auf "Datum wählen...". '
+      + box.textContent + ' - bitte erneut tippen, wenn das stimmt.';
+    box.classList.add('problem');
+    return;
+  }}
+
   // Same selector for both buttons ("weekend" and "results"): a mode, or a
   // picked date - the server turns a date into its whole Mon-Sun week.
   const mode = document.getElementById(kind + '-mode').value;
   let url = '/run/' + kind + '?mode=' + encodeURIComponent(mode);
   if (mode === 'date') {{
-    const day = document.getElementById(kind + '-day').value;
-    if (!day) {{
-      alert('Bitte zuerst ein Datum wählen.');
+    const check = readDay(kind);
+    if (!check.ok) {{
+      showPreview(kind, check.message, true);
+      document.getElementById(kind + '-day').focus();
       return;
     }}
-    url += '&day=' + encodeURIComponent(day);
+    url += '&day=' + encodeURIComponent(check.day);
   }}
 
   const buttons = document.querySelectorAll('.buttons button, .buttons select, .buttons input');
@@ -897,6 +1032,13 @@ def start_job(
             raise HTTPException(409, "Es läuft bereits eine Generierung.")
     threading.Thread(target=_run_job, args=(kind, extra_args), daemon=True).start()
     return {"started": True}
+
+
+@app.get("/period")
+def period_preview(kind: str, day: str, _: None = Depends(require_auth)) -> dict:
+    if kind not in JOB_COMMANDS:
+        raise HTTPException(404, "Unbekannte Aktion.")
+    return {"text": _describe_period(kind, day)}
 
 
 @app.get("/run/status")

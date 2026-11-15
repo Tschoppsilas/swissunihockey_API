@@ -173,3 +173,76 @@ def test_summary_says_when_there_were_no_home_games():
     summary = webapp._build_summary("results", log, True)
     assert "Erzeugt: 2 Story-Bilder." in summary and "Keine Heimspiele in diesem Zeitraum" in summary
     assert "Feed-Post-Bild" not in summary
+
+
+# --- a date must never be silently ignored, and the preview comes from the server ---
+
+
+@pytest.mark.parametrize("kind,mode", [("results", "current"), ("results", "last"), ("weekend", "upcoming"), ("weekend", "")])
+def test_a_date_with_a_non_date_selection_is_refused_not_ignored(kind, mode):
+    with pytest.raises(HTTPException) as exc:
+        webapp._selection_args(kind, mode, "2026-11-15")
+    assert exc.value.status_code == 400
+    assert "Datum" in exc.value.detail
+
+
+def test_start_job_refuses_a_date_with_the_default_selection(monkeypatch):
+    monkeypatch.setattr(webapp.threading, "Thread", lambda target, args, daemon: pytest.fail("must not start"))
+    webapp.JOB["running"] = False
+    with pytest.raises(HTTPException) as exc:
+        webapp.start_job("results", mode="current", day="2026-11-15", _=None)
+    assert exc.value.status_code == 400
+    assert not webapp.JOB["running"]
+
+
+@pytest.mark.parametrize("kind", ["results", "weekend"])
+@pytest.mark.parametrize(
+    "day,picked",
+    [
+        ("2026-11-09", "Mo 09.11.2026"),
+        ("2026-11-10", "Di 10.11.2026"),
+        ("2026-11-11", "Mi 11.11.2026"),
+        ("2026-11-12", "Do 12.11.2026"),
+        ("2026-11-13", "Fr 13.11.2026"),
+        ("2026-11-14", "Sa 14.11.2026"),
+        ("2026-11-15", "So 15.11.2026"),
+    ],
+)
+def test_period_preview_for_every_weekday(kind, day, picked):
+    expected = f"Gewählt: {picked} -> Zeitraum Mo 09.11. - So 15.11.2026"
+    assert webapp.period_preview(kind, day, None) == {"text": expected}
+
+
+def test_period_preview_year_boundary_and_next_week():
+    assert webapp.period_preview("results", "2027-01-01", None)["text"] == (
+        "Gewählt: Fr 01.01.2027 -> Zeitraum Mo 28.12. - So 03.01.2027"
+    )
+    assert webapp.period_preview("weekend", "2026-11-22", None)["text"] == (
+        "Gewählt: So 22.11.2026 -> Zeitraum Mo 16.11. - So 22.11.2026"
+    )
+
+
+@pytest.mark.parametrize("day", ["", "15.11.2026", "2026-13-40", "morgen", "2026-11-15; ls"])
+def test_period_preview_rejects_unreadable_dates(day):
+    with pytest.raises(HTTPException) as exc:
+        webapp.period_preview("results", day, None)
+    assert exc.value.status_code == 400
+
+
+def test_period_preview_rejects_unknown_kind():
+    with pytest.raises(HTTPException) as exc:
+        webapp.period_preview("posten", "2026-11-15", None)
+    assert exc.value.status_code == 404
+
+
+def test_page_wires_up_the_preview_and_the_consistency_checks():
+    html = webapp.render_page().body.decode()
+    for kind in ("weekend", "results"):
+        assert f'id="{kind}-preview"' in html
+        assert f"onDayChange('{kind}')" in html and f"onModeChange('{kind}')" in html
+    for snippet in (
+        "function readDay(kind)", "function syncMode(kind)", "async function updatePreview(kind)",
+        "addEventListener('pageshow'", "Bitte ein Datum wählen.", "Das Datum ist nicht lesbar",
+        "'/period?kind='",
+    ):
+        assert snippet in html, snippet

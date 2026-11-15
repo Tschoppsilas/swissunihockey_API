@@ -3,11 +3,8 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import click
-
-SWISS_TZ = ZoneInfo("Europe/Zurich")
 
 
 def _ensure_utf8_console() -> None:
@@ -29,10 +26,11 @@ from . import layout
 from .api_client import ApiClient
 from .config import load_config, load_team_labels
 from .grouping import (
+    PERIOD_MODES,
+    SWISS_TZ,
     format_weekend_title,
     group_by_category,
     group_games_by_week,
-    PERIOD_MODES,
     half_season_end,
     paginate_by_category,
     resolve_period,

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from . import layout
 from .models import TeamGame
+
+# The server (Render) runs in UTC; every "today"/"now" of the app is Swiss time.
+SWISS_TZ = ZoneInfo("Europe/Zurich")
 
 
 def week_bounds(d: date) -> tuple[date, date]:
