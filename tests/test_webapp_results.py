@@ -167,7 +167,7 @@ def test_summary_names_the_games_period_and_the_fallback_note():
 def test_page_has_a_gallery_for_home_results_and_the_client_category_rules():
     html = webapp.render_page().body.decode()
     assert "Heimspiel-Resultate (Feed)" in html and "gallery-home_results" in html
-    assert "['announcements', 'home_results'].includes(categoryOf(p))" in html
+    assert "['announcements', 'home_results', 'tables'].includes(categoryOf(p))" in html
     assert "['story', 'results'].includes(categoryOf(p))" in html  # story: still no home_results
 
 

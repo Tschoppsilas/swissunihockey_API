@@ -556,10 +556,30 @@ def tables(season: int | None, label: str, stand: datetime | None, output_dir: P
     def say(text: str) -> None:
         click.echo(ascii_text(text))
 
-    groups, skipped = collect_tables(client, teams, labels, cfg.tables_exclude_categories, season, say)
+    say(f"Titel-Zusatz: {label.strip() or 'keiner'}")
+
+    def fetched(done: int, total: int) -> None:
+        # Machine-readable progress line (the web app turns it into the progress bar).
+        click.echo(f"[progress] Tabelle {done}/{total} geladen")
+
+    groups, skipped = collect_tables(
+        client, teams, labels, cfg.tables_exclude_categories, season, say, progress=fetched
+    )
+
+    # Only a note: teams of one table with different numbers of games usually mean
+    # a matchday is still running. Nothing is blocked.
+    uneven = [
+        labels.get(team.id, team.category)
+        for group in groups
+        if len({e.games for e in group.table.entries}) > 1
+        for team in group.tvo_teams
+    ]
+    if uneven:
+        say(f"Hinweis: Ungleiche Spielzahl: {', '.join(uneven)} (laufender Spieltag?)")
 
     template = TableTemplate()
     written = 0
+    written_paths: list[Path] = []
     used: set[Path] = set()
     for group in groups:
         table = group.table
@@ -583,6 +603,18 @@ def tables(season: int | None, label: str, stand: datetime | None, output_dir: P
             continue
         say(f"  geschrieben: {path} (Skalierung {scale:.2f})")
         written += 1
+        written_paths.append(path)
+        click.echo(f"[progress] Bild {written}/{len(groups)} erstellt")
+
+    # A new run replaces the images of its season: anything left over from an earlier run
+    # (a group that no longer exists, a renamed file) is removed, so the gallery never
+    # shows duplicates. Only done when this run actually produced images.
+    if written_paths:
+        for folder in sorted({p.parent for p in written_paths}):
+            for old in sorted(folder.glob("*.png")):
+                if old not in written_paths:
+                    old.unlink()
+                    say(f"Entfernt (veraltet): {old.name}")
 
     count = len(groups) if dry_run else written
     say("")

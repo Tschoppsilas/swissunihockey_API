@@ -57,7 +57,11 @@ BASIC_AUTH_USERNAME = "TVOberwil"
 JOB_COMMANDS: dict[str, list[list[str]]] = {
     "weekend": [["weekend"]],
     "results": [["results"]],
+    "tables": [["tables"]],
 }
+
+# The "Zusatz" choices of the table button -> the text added to the title's "Stand" line.
+TABLE_LABELS = {"": "", "winterpause": "Winterpause", "saisonende": "Saisonende"}
 
 JOB_LOCK = threading.Lock()
 JOB: dict = {
@@ -72,7 +76,7 @@ JOB: dict = {
 }
 
 STORY_CATEGORIES = ("story", "results")
-FEED_CATEGORIES = ("announcements", "home_results")
+FEED_CATEGORIES = ("announcements", "home_results", "tables")
 MAX_STORY_IMAGES = 10
 MAX_FEED_IMAGES = CAROUSEL_MAX_ITEMS
 PUBLIC_IMAGE_TTL_SECONDS = 900
@@ -106,6 +110,10 @@ WROTE_STORY_RE = re.compile(r"geschrieben:.*[/\\]story[/\\]")
 WROTE_FEED_RE = re.compile(r"geschrieben:.*[/\\]announcements[/\\]")
 WROTE_HOME_RESULTS_RE = re.compile(r"geschrieben:.*[/\\]home_results[/\\]")
 WROTE_RESULTS_RE = re.compile(r"geschrieben:.*[/\\]results[/\\]")
+WROTE_TABLES_RE = re.compile(r"geschrieben:.*[/\\]tables[/\\]")
+TABLES_SEASON_RE = re.compile(r"[/\\]tables[/\\](\d{4})[/\\]")
+TABLE_FETCH_RE = re.compile(r"\[progress\] Tabelle (\d+)/(\d+) geladen")
+TABLE_IMAGE_RE = re.compile(r"\[progress\] Bild (\d+)/(\d+) erstellt")
 
 app = FastAPI(title="TV Oberwil Social")
 security = HTTPBasic()
@@ -129,6 +137,19 @@ def _parse_progress(kind: str, line: str, ctx: dict) -> tuple[int, str] | None:
     each team's fixtures over HTTP is by far the slowest part of any
     command, so that loop (see cli._fetch_team_games's "[progress]" lines)
     carries most of the bar; rendering is comparatively instant."""
+    if kind == "tables":
+        match = TABLE_FETCH_RE.search(line)
+        if match:
+            done, total = int(match[1]), int(match[2])
+            return 5 + round((done / total if total else 1.0) * 65), f"Lade Tabellen ({done}/{total})..."
+        match = TABLE_IMAGE_RE.search(line)
+        if match:
+            done, total = int(match[1]), int(match[2])
+            return 70 + round((done / total if total else 1.0) * 28), f"Erstelle Tabellen-Bild {done}/{total}..."
+        if line.startswith("Keine Tabellen erzeugt"):
+            return 100, "Keine Tabellen erzeugt."
+        return None
+
     match = TEAM_PROGRESS_RE.search(line)
     if match:
         done, total, status = int(match[1]), int(match[2]), match[3]
@@ -201,6 +222,21 @@ def _selection_args(kind: str, mode: str, day: str, scope: str = "") -> list[str
     return ["--weekend", mode]
 
 
+def _job_args(kind: str, mode: str, day: str, scope: str, label: str) -> list[str]:
+    """CLI arguments for any job. "tables" has only the "Zusatz" choice, the other
+    two only the period selector - a value for the wrong button is refused, never
+    silently dropped."""
+    if kind == "tables":
+        if mode or day or scope:
+            raise HTTPException(400, "Zeitraum und Datum gelten nicht für Tabellen.")
+        if label not in TABLE_LABELS:
+            raise HTTPException(400, "Unbekannter Zusatz für den Titel.")
+        return ["--label", TABLE_LABELS[label]] if TABLE_LABELS[label] else []
+    if label:
+        raise HTTPException(400, "Ein Zusatz gilt nur für Tabellen.")
+    return _selection_args(kind, mode, day, scope)
+
+
 def _describe_period(kind: str, day: str, scope: str = "day") -> str:
     """What the server makes of a picked date and scope, e.g. 'Gewählt: So
     15.11.2026 -> nur dieser Tag' or '... -> Sa 14.11. - So 15.11.' - computed by
@@ -263,6 +299,35 @@ def _run_job(kind: str, extra_args: list[str] | None = None) -> None:
             JOB["percent"] = 100
 
 
+def _tables_summary(log_text: str) -> str:
+    """Summary of a table run: number of images, the title addition, skipped groups
+    with their reason, the excluded categories and the uneven-games note."""
+    lines = [l.strip() for l in log_text.splitlines()]
+    images = [l for l in lines if WROTE_TABLES_RE.search(l)]
+    addition = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("Titel-Zusatz:")), "keiner")
+    season_match = TABLES_SEASON_RE.search(images[0]) if images else None
+    season = f" (Saison {season_match[1]})" if season_match else ""
+    addition_text = "Kein Zusatz" if addition == "keiner" else f"Zusatz: {escape(addition)}"
+
+    count = len(images)
+    if count:
+        noun = "Tabellen-Bild" if count == 1 else "Tabellen-Bilder"
+        summary = f"Erzeugt: {count} {noun}{season}. {addition_text}."
+    else:
+        summary = f"Keine Tabellen erzeugt. {addition_text}."
+
+    for line in lines:
+        if line.startswith("Hinweis:"):
+            summary += f"<div class='warn'>{escape(line.split(':', 1)[1].strip())}</div>"
+    for line in lines:
+        if line.startswith("UEBERSPRUNGEN:"):
+            summary += f"<div class='warn'>Übersprungen: {escape(line.split(':', 1)[1].strip())}</div>"
+    for line in lines:
+        if line.endswith("ausgeschlossen (Konfiguration)"):
+            summary += f"<div class='muted'>{escape(line)}</div>"
+    return summary
+
+
 def _build_summary(kind: str, log_text: str, ok: bool) -> str:
     """Short, human-readable result instead of the raw CLI output - counts
     written images and any "FEHLENDE HALLE:"/"FEHLENDES RESULTAT:" warnings
@@ -271,6 +336,8 @@ def _build_summary(kind: str, log_text: str, ok: bool) -> str:
     from a temp file."""
     if not ok:
         return "<span class='fail'>Fehler bei der Generierung - Details siehe Render-Logs.</span>"
+    if kind == "tables":
+        return _tables_summary(log_text)
 
     lines = log_text.splitlines()
     story_count = sum(1 for l in lines if WROTE_STORY_RE.search(l))
@@ -484,6 +551,8 @@ def render_galleries_block() -> str:
         f"<div id='gallery-results'>{render_gallery('results')}</div>"
         "<h2>Heimspiel-Resultate (Feed)</h2>"
         f"<div id='gallery-home_results'>{render_gallery('home_results')}</div>"
+        "<h2>Tabellen (Feed)</h2>"
+        f"<div id='gallery-tables'>{render_gallery('tables')}</div>"
     )
 
 
@@ -509,6 +578,7 @@ PAGE_TEMPLATE = """<!doctype html>
   button:active {{ background: #a10d25; }}
   button:disabled {{ background: #d99; }}
   .job-group {{ display: flex; flex-direction: column; gap: 8px; }}
+  .field-label {{ font-size: 0.8rem; color: #666; margin-bottom: -4px; }}
   .date-row {{ display: flex; flex-wrap: wrap; gap: 8px; }}
   .date-row[hidden] {{ display: none; }}
   .date-row .results-option {{ flex: 1 1 11rem; width: auto; min-width: 0; }}
@@ -615,6 +685,15 @@ PAGE_TEMPLATE = """<!doctype html>
     </div>
     <div id="results-preview" class="period-preview" role="status"></div>
   </div>
+  <div class="job-group">
+    <button onclick="runJob('tables')">Tabellen generieren</button>
+    <label class="field-label" for="tables-label">Zusatz</label>
+    <select id="tables-label" class="results-option" aria-label="Zusatz für den Titel der Tabellen">
+      <option value="">Kein Zusatz (Standard)</option>
+      <option value="winterpause">Winterpause</option>
+      <option value="saisonende">Saisonende</option>
+    </select>
+  </div>
 </div>
 <div class="buttons">
   <button id="ig-check-btn" onclick="checkInstagram()">Instagram-Verbindung testen</button>
@@ -656,6 +735,7 @@ PAGE_TEMPLATE = """<!doctype html>
 const BUTTON_LABELS = {{
   weekend: "Kommendes Wochenende",
   results: "Resultate generieren",
+  tables: "Tabellen generieren",
 }};
 
 function renderStatus(s) {{
@@ -769,11 +849,11 @@ function confirmAndPost(kind) {{
 
   const wrongCategory = kind === 'story'
     ? selection.find(p => !['story', 'results'].includes(categoryOf(p)))
-    : selection.find(p => !['announcements', 'home_results'].includes(categoryOf(p)));
+    : selection.find(p => !['announcements', 'home_results', 'tables'].includes(categoryOf(p)));
   if (wrongCategory) {{
     alert(kind === 'story'
       ? 'Für "Als Story posten" bitte nur Story- oder Resultate-Bilder auswählen (nicht: ' + wrongCategory + ').'
-      : 'Für "Als Feed-Post posten" bitte nur Ankündigungs- oder Heimspiel-Resultate-Bilder auswählen (nicht: ' + wrongCategory + ').');
+      : 'Für "Als Feed-Post posten" bitte nur Feed-Bilder (Ankündigungen, Heimspiel-Resultate oder Tabellen) auswählen (nicht: ' + wrongCategory + ').');
     return;
   }}
   if (kind === 'feed' && selection.length > 10) {{
@@ -988,7 +1068,10 @@ function syncAllSelectors() {{
 window.addEventListener('pageshow', syncAllSelectors);
 window.addEventListener('load', syncAllSelectors);
 
-async function runJob(kind) {{
+// The start URL for "weekend" / "results" from their selector (a mode, or a picked
+// date plus its scope: only that day / Sat+Sun / whole week). Returns null after
+// showing a message if the job must not start.
+async function selectionUrl(kind) {{
   // Never start with a selection that contradicts the date field.
   if (syncMode(kind)) {{
     await updatePreview(kind);
@@ -996,11 +1079,9 @@ async function runJob(kind) {{
     box.textContent = 'Ein Datum war eingetragen, die Auswahl steht jetzt auf "Datum wählen...". '
       + box.textContent + ' - bitte erneut tippen, wenn das stimmt.';
     box.classList.add('problem');
-    return;
+    return null;
   }}
 
-  // Same selector for both buttons ("weekend" and "results"): a mode, or a
-  // picked date plus its scope (only that day / Sat+Sun / whole week).
   const mode = document.getElementById(kind + '-mode').value;
   let url = '/run/' + kind + '?mode=' + encodeURIComponent(mode);
   if (mode === 'date') {{
@@ -1008,10 +1089,22 @@ async function runJob(kind) {{
     if (!check.ok) {{
       showPreview(kind, check.message, true);
       document.getElementById(kind + '-day').focus();
-      return;
+      return null;
     }}
     url += '&day=' + encodeURIComponent(check.day)
       + '&scope=' + encodeURIComponent(document.getElementById(kind + '-scope').value);
+  }}
+  return url;
+}}
+
+async function runJob(kind) {{
+  let url;
+  if (kind === 'tables') {{
+    // The table button has only the "Zusatz" choice (title addition), no period.
+    url = '/run/tables?label=' + encodeURIComponent(document.getElementById('tables-label').value);
+  }} else {{
+    url = await selectionUrl(kind);
+    if (!url) return;
   }}
 
   const buttons = document.querySelectorAll('.buttons button, .buttons select, .buttons input');
@@ -1065,11 +1158,16 @@ def partial_galleries(_: None = Depends(require_auth)) -> HTMLResponse:
 
 @app.post("/run/{kind}")
 def start_job(
-    kind: str, mode: str = "", day: str = "", scope: str = "", _: None = Depends(require_auth)
+    kind: str,
+    mode: str = "",
+    day: str = "",
+    scope: str = "",
+    label: str = "",
+    _: None = Depends(require_auth),
 ) -> dict:
     if kind not in JOB_COMMANDS:
         raise HTTPException(404, "Unbekannte Aktion.")
-    extra_args = _selection_args(kind, mode, day, scope)
+    extra_args = _job_args(kind, mode, day, scope, label)
     with JOB_LOCK:
         if JOB["running"]:
             raise HTTPException(409, "Es läuft bereits eine Generierung.")
@@ -1081,7 +1179,7 @@ def start_job(
 def period_preview(
     kind: str, day: str, scope: str = "day", _: None = Depends(require_auth)
 ) -> dict:
-    if kind not in JOB_COMMANDS:
+    if kind not in ("weekend", "results"):
         raise HTTPException(404, "Unbekannte Aktion.")
     return {"text": _describe_period(kind, day, scope)}
 
@@ -1161,7 +1259,7 @@ def start_feed_post(body: FeedPostRequest, _: None = Depends(require_auth)) -> d
         raise HTTPException(400, f"Der Text ist zu lang ({len(caption)} von {CAPTION_MAX_CHARS} Zeichen).")
     return _start_post(
         "feed", body.paths, FEED_CATEGORIES, MAX_FEED_IMAGES,
-        "Nur Feed-Bilder (Ankündigungen oder Heimspiel-Resultate) erlaubt", _run_feed_job, (caption,),
+        "Nur Feed-Bilder (Ankündigungen, Heimspiel-Resultate oder Tabellen) erlaubt", _run_feed_job, (caption,),
     )
 
 

@@ -66,6 +66,7 @@ def collect_tables(
     exclude_categories: tuple[str, ...] | list[str],
     season: int | None,
     log: Callable[[str], None],
+    progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[TableGroup], list[SkippedTable]]:
     """One TableGroup per distinct table. Always asks the team endpoint (league
     codes and group numbers change every season); two teams whose tables hold
@@ -75,16 +76,20 @@ def collect_tables(
     skipped: list[SkippedTable] = []
     announced: set[str] = set()
 
+    todo: list[Team] = []
     for team in teams:
-        label = labels.get(team.id, team.category)
         pattern = excluded_by(team.category, exclude_categories)
-        if pattern is not None:
-            if pattern not in announced:
-                announced.add(pattern)
-                log(f"{pattern}: ausgeschlossen (Konfiguration)")
-            continue
+        if pattern is None:
+            todo.append(team)
+        elif pattern not in announced:
+            announced.add(pattern)
+            log(f"{pattern}: ausgeschlossen (Konfiguration)")
 
+    for index, team in enumerate(todo, start=1):
+        label = labels.get(team.id, team.category)
         result = client.get_team_table(team.id, season)
+        if progress is not None:
+            progress(index, len(todo))
         if result is None:
             skipped.append(SkippedTable(label, team.category, "keine Tabelle (404)"))
             continue

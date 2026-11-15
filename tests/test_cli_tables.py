@@ -182,3 +182,84 @@ def test_a_table_that_cannot_fit_is_reported_not_cut_off(setup, tmp_path, monkey
 def test_nothing_to_do_says_so(setup, monkeypatch):
     monkeypatch.setattr(cli, "get_teams", lambda client, cfg: [])
     assert "Keine Tabellen erzeugt." in run()
+
+
+# --- additions for the web app: progress lines, uneven games, replacing old images ---
+
+
+def test_progress_lines_for_the_web_app_progress_bar(setup):
+    out = run()
+    fetched = [line for line in out.splitlines() if line.startswith("[progress] Tabelle ")]
+    assert fetched[0] == "[progress] Tabelle 1/5 geladen" and fetched[-1] == "[progress] Tabelle 5/5 geladen"  # 5 non-excluded teams
+    created = [line for line in out.splitlines() if line.startswith("[progress] Bild ")]
+    assert created == ["[progress] Bild 1/3 erstellt", "[progress] Bild 2/3 erstellt", "[progress] Bild 3/3 erstellt"]
+
+
+def test_the_title_addition_is_logged_for_the_summary(setup):
+    assert "Titel-Zusatz: keiner" in run().splitlines()
+    assert "Titel-Zusatz: Winterpause" in run("--label", "Winterpause").splitlines()
+
+
+def test_uneven_games_give_a_note_but_block_nothing(setup, tmp_path, monkeypatch):
+    uneven = [raw_entry(1, 9, "UHC Foo", games=5), raw_entry(2, 431471, "TV Oberwil BL", CLUB, games=6)]
+    monkeypatch.setitem(TABLES, 431471, (hdr("Herren Aktive GF 4. Liga"), uneven))
+    out = run()
+    assert "Hinweis: Ungleiche Spielzahl: Herren (laufender Spieltag?)" in out.splitlines()
+    assert (tmp_path / "tables" / "2026" / "herren-aktive-gf-4-liga.png").is_file()  # still generated
+
+
+def test_equal_games_give_no_note(setup):
+    assert "Ungleiche Spielzahl" not in run()
+
+
+def test_the_note_lists_every_tvo_team_of_every_uneven_table(setup, monkeypatch):
+    d_uneven = [raw_entry(1, 430043, "TV Oberwil BL I", CLUB, games=8), raw_entry(2, 428478, "TV Oberwil BL II", CLUB, games=7)]
+    monkeypatch.setitem(TABLES, 428478, (hdr("Junioren D Regional"), d_uneven))
+    monkeypatch.setitem(TABLES, 430043, (hdr("Junioren D Regional"), d_uneven))
+    uneven = [raw_entry(1, 9, "UHC Foo", games=5), raw_entry(2, 431471, "TV Oberwil BL", CLUB, games=6)]
+    monkeypatch.setitem(TABLES, 431471, (hdr("Herren Aktive GF 4. Liga"), uneven))
+    out = run()
+    assert "Hinweis: Ungleiche Spielzahl: D Weiss, D Rot, Herren (laufender Spieltag?)" in out.splitlines()
+
+
+def test_a_new_run_replaces_the_old_images_of_the_season(setup, tmp_path):
+    folder = tmp_path / "tables" / "2026"
+    folder.mkdir(parents=True)
+    (folder / "gruppe-gibt-es-nicht-mehr.png").write_bytes(b"old")
+    (folder / "junioren-d-regional.png").write_bytes(b"old")  # same name: overwritten, not duplicated
+    (folder / "notiz.txt").write_text("bleibt")
+    other_season = tmp_path / "tables" / "2025"
+    other_season.mkdir()
+    (other_season / "alt.png").write_bytes(b"other season")
+    out = run()
+    assert "Entfernt (veraltet): gruppe-gibt-es-nicht-mehr.png" in out
+    assert sorted(p.name for p in folder.glob("*.png")) == [
+        "herren-aktive-gf-4-liga.png", "junioren-d-regional.png", "juniorinnen-zuerich-u17-b.png",
+    ]
+    assert (folder / "junioren-d-regional.png").read_bytes() != b"old"
+    assert (folder / "notiz.txt").exists() and (other_season / "alt.png").exists()  # nothing else is touched
+
+
+def test_running_twice_gives_no_duplicates(setup, tmp_path):
+    run()
+    first = sorted(p.name for p in (tmp_path / "tables" / "2026").glob("*.png"))
+    run("--label", "Winterpause")
+    assert sorted(p.name for p in (tmp_path / "tables" / "2026").glob("*.png")) == first
+
+
+def test_nothing_is_deleted_when_a_run_produces_no_images(setup, tmp_path, monkeypatch):
+    folder = tmp_path / "tables" / "2026"
+    folder.mkdir(parents=True)
+    (folder / "behalten.png").write_bytes(b"keep")
+    monkeypatch.setattr(cli, "get_teams", lambda client, cfg: [TEAMS[3]])  # only the team without a table (404)
+    out = run()
+    assert "Keine Tabellen erzeugt." in out
+    assert (folder / "behalten.png").exists()
+
+
+def test_a_dry_run_deletes_nothing(setup, tmp_path):
+    folder = tmp_path / "tables" / "2026"
+    folder.mkdir(parents=True)
+    (folder / "alt.png").write_bytes(b"old")
+    run("--dry-run")
+    assert (folder / "alt.png").exists()
